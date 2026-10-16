@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.out
+*.pdb
+*.ilk
+build/
+bin/
+obj/
+
+# Editor / OS
+.vscode/
+.vs/
+*.swp
+Thumbs.db
+.DS_Store
