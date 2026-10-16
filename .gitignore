@@ -19,3 +19,6 @@ obj/
 *.swp
 Thumbs.db
 .DS_Store
+
+# Referans Geriatrix klonu (salt okunur, repoya dahil degil)
+geriatrix/
