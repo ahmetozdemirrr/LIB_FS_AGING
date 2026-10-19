@@ -1,28 +1,18 @@
 /*
- * fs_aging.h - File system aging kutuphanesi (Geriatrix tabanli)
+ * fs_aging.h - File system aging library.
  *
- * Platformdan bagimsiz core. fs_aging.c hicbir OS / APEX / POSIX header'i
- * ve libc fonksiyonu kullanmaz, kendi icinde bellek ayirmaz.
+ * Portable core: no OS headers, no libc calls, no dynamic memory.
+ * Based on Geriatrix: https://github.com/saurabhkadekodi/geriatrix (BSD-2-Clause)
  *
- * Kullanim:
- *   1. Port katmani fs_aging_platform_t'yi doldurur.
- *   2. Cagiran taraf dosya kayit havuzunu verir:
- *          static fs_aging_file_t pool[50000];
- *      Gerekli kapasite fs_aging_estimate_files() ile bulunur (dogrudan
- *      kullanilabilir, ek pay gerekmez).
- *   3. fs_aging_init() bir kez cagrilir.
- *   4. fs_aging_step() FS_AGING_RUNNING disinda bir deger donene kadar
- *      tekrar tekrar cagrilir (ARINC653'te periyodik process'ten).
+ * Usage:
+ *   1. Fill an fs_aging_platform_t with your platform callbacks.
+ *   2. Allocate a pool of file records, sized with fs_aging_estimate_files().
+ *   3. Call fs_aging_init() once.
+ *   4. Call fs_aging_step() repeatedly until it returns anything other
+ *      than FS_AGING_RUNNING.
  *
- * Calisma asamalari (hepsi fs_aging_step() icinde, parca parca yurur):
- *   SETUP  : profilin gerektirdigi dizin agaci olusturulur.
- *   FILL   : volume, fill_ratio oranina kadar profile gore doldurulur.
- *            Sonunda dosyalar islem basina FS_AGING_REBIN_CHUNK kayit
- *            taranarak yas kovalarina yerlestirilir (asama FILL gorunur).
- *   STABLE : rastgele olustur/sil islemleriyle yas, boyut ve dizin
- *            dagilimlari profile yakinsatilir.
- *
- * Orijinal: https://github.com/saurabhkadekodi/geriatrix (BSD-2-Clause)
+ * Phases: SETUP creates the directory tree, FILL fills the volume up to
+ * the fill target, STABLE ages the files with random creates and deletes.
  */
 
 #ifndef FS_AGING_H
@@ -36,113 +26,112 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Derleme zamani limitleri (gerekirse derleyici -D ile degistirilir)  */
+/* Compile-time limits (override with -D if needed)                    */
 /* ------------------------------------------------------------------ */
 
-/* Mount point dahil olusturulan en uzun yol (sonlandirici '\0' dahil).
- * fs_aging_init() profilin uretecegi en uzun yolu bu sinirla karsilastirir. */
+/* Use the same values in every file that includes this header. */
+
+/* Longest path, including the mount point and the terminating '\0'. */
 #ifndef FS_AGING_PATH_MAX
 #define FS_AGING_PATH_MAX        256u
 #endif
 
-/* Bir profildeki yas / boyut / dizin satiri sayisi ust siniri. */
+/* Maximum number of rows in each profile distribution. */
 #ifndef FS_AGING_MAX_BINS
 #define FS_AGING_MAX_BINS        48u
 #endif
 
-/* Silinecek dosya secilirken incelenen rastgele aday sayisi. Buyudukce
- * dagilimlar daha hizli yakinsar, islem basina maliyet artar. */
+/* Candidates checked when choosing a file to delete. */
 #ifndef FS_AGING_DELETE_SAMPLES
 #define FS_AGING_DELETE_SAMPLES  32u
 #endif
 
-/* FILL -> STABLE gecisinde doldurma dosyalari yas kovalarina parca parca
- * yerlestirilir; her islemde en fazla bu kadar havuz kaydi taranir.
- * Boylece tek bir fs_aging_step() suresi havuz boyutundan bagimsizdir. */
+/* Pool records scanned per op at the end of the FILL phase. */
 #ifndef FS_AGING_REBIN_CHUNK
 #define FS_AGING_REBIN_CHUNK     1024u
 #endif
 
-/* Kayan noktali tip. ARINC653 port'u float8_gt ile ayni boyutta
- * oldugunu derleme zamaninda dogrular. */
+/* Floating point type used by the library. */
 typedef double fs_aging_float_t;
 
 /* ------------------------------------------------------------------ */
-/* Durum kodlari                                                       */
+/* Status codes                                                        */
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    FS_AGING_RUNNING = 0,          /* devam ediyor, step'i tekrar cagir      */
-    FS_AGING_DONE_CONVERGED,       /* yas dagilimi profile tam yakinsadi     */
-    FS_AGING_DONE_TOLERANCE,       /* yas hatasi confidence sinirina indi    */
-    FS_AGING_DONE_WORKLOAD_LIMIT,  /* overwrite_runs sinirina ulasildi       */
-    FS_AGING_DONE_TIME_LIMIT,      /* time_limit_s sinirina ulasildi         */
-    FS_AGING_ERR_PARAM,            /* gecersiz profil / config / platform    */
-    FS_AGING_ERR_POOL_FULL,        /* FILL asamasinda kayit havuzu yetmedi   */
-    FS_AGING_ERR_PATH_TOO_LONG,    /* profil FS_AGING_PATH_MAX'i asiyor      */
-    FS_AGING_ERR_PLATFORM          /* platform callback'i hata dondu ya da
-                                      olusturma yapilamadi ve silinecek
-                                      dosya yok (ilerleme imkansiz)          */
+    FS_AGING_RUNNING = 0,          /* still running, call step again        */
+    FS_AGING_DONE_CONVERGED,       /* age distribution matches the profile  */
+    FS_AGING_DONE_TOLERANCE,       /* age error is within confidence        */
+    FS_AGING_DONE_WORKLOAD_LIMIT,  /* overwrite_runs limit reached          */
+    FS_AGING_DONE_TIME_LIMIT,      /* time_limit_s limit reached            */
+    FS_AGING_ERR_PARAM,            /* invalid argument (profile, config,
+                                      platform or pool)                     */
+    FS_AGING_ERR_POOL_FULL,        /* pool too small during FILL            */
+    FS_AGING_ERR_PATH_TOO_LONG,    /* a path exceeds FS_AGING_PATH_MAX      */
+    FS_AGING_ERR_PLATFORM          /* a callback failed, or no progress
+                                      is possible                           */
 } fs_aging_status_t;
 
-/* Platform callback'lerinin donus degerleri. */
+/* Return values of the platform callbacks. */
 typedef enum {
-    FS_AGING_PLAT_OK = 0,
-    FS_AGING_PLAT_NO_SPACE,        /* volume dolu: core bunun yerine silme yapar
-                                      (canli dosya yoksa silme yapilmaz)        */
-    FS_AGING_PLAT_ERROR            /* diger tum hatalar: aging durur             */
+    FS_AGING_PLAT_OK = 0,          /* success                               */
+    FS_AGING_PLAT_NO_SPACE,        /* create_file only: volume full, the
+                                      library deletes a file instead        */
+    FS_AGING_PLAT_ERROR            /* any other error: aging stops          */
 } fs_aging_plat_result_t;
 
 /* ------------------------------------------------------------------ */
-/* Platform arayuzu - port katmani doldurur                            */
+/* Platform callbacks                                                  */
 /* ------------------------------------------------------------------ */
 
+/* path is valid only during the call; copy it if needed. */
+
 typedef struct {
-    /* size_bytes boyutunda dosya olusturur (yer ayirma veya veri yazma). */
+    /* Create a file of size_bytes. */
     fs_aging_plat_result_t (*create_file)(void *user, const char *path,
                                           uint64_t size_bytes);
 
-    /* Dosyayi siler. */
+    /* Delete a file. */
     fs_aging_plat_result_t (*delete_file)(void *user, const char *path);
 
-    /* Tek seviye dizin olusturur. Dizin zaten varsa FS_AGING_PLAT_OK
-     * donmelidir. Ust dizinleri sirayla core olusturur. */
+    /* Create one directory level. Must return FS_AGING_PLAT_OK if the
+     * directory already exists. */
     fs_aging_plat_result_t (*make_dir)(void *user, const char *path);
 
-    /* Opsiyonel: monoton zaman, milisaniye. NULL ise sure siniri yok. */
+    /* Optional: monotonic time in milliseconds. NULL disables time_limit_s. */
     uint64_t (*now_ms)(void *user);
 
-    /* Opsiyonel: asama gecisi ve hata mesajlari. NULL ise basilmaz. */
+    /* Optional: log output. NULL disables logging. */
     void (*log)(void *user, const char *msg);
 
-    /* Callback'lere aynen iletilen kullanici verisi. */
+    /* User data passed to every callback. */
     void *user;
 } fs_aging_platform_t;
 
 /* ------------------------------------------------------------------ */
-/* Aging profili (Geriatrix profil dosyalarinin karsiligi)             */
+/* Aging profile                                                       */
 /* ------------------------------------------------------------------ */
 
-/* age_distribution.txt satiri: "<yas_esigi> <agirlik>"
- * Esikler artan sirada olmalidir. En az 2 satir gerekir. */
+/* File age row. Cutoffs must be increasing; at least 2 rows. */
 typedef struct {
     fs_aging_float_t age_cutoff;
     fs_aging_float_t weight;
 } fs_aging_age_bin_t;
 
-/* size_distribution.txt satiri: "<boyut_byte> <agirlik>" */
+/* File size row. */
 typedef struct {
     uint64_t         size_bytes;
     fs_aging_float_t weight;
 } fs_aging_size_bin_t;
 
-/* dir_distribution.txt satiri: "<derinlik> <agirlik> <kardes_dizin_sayisi>" */
+/* Directory row: depth, weight and number of sibling directories. */
 typedef struct {
     uint32_t         depth;
     fs_aging_float_t weight;
     uint32_t         sibling_dirs;
 } fs_aging_dir_bin_t;
 
+/* A profile: age, size and directory distributions. */
 typedef struct {
     const char                *name;
     const fs_aging_age_bin_t  *ages;
@@ -154,49 +143,45 @@ typedef struct {
 } fs_aging_profile_t;
 
 /* ------------------------------------------------------------------ */
-/* Calisma parametreleri (parantez icinde orijinal Geriatrix parametresi) */
+/* Run configuration                                                   */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    const char       *mount_point;    /* sonunda '/' olmadan, or. "/fs0"   (-m)
-                                         aging boyunca gecerli kalmalidir      */
-    uint64_t          volume_bytes;   /* dosya sistemi toplam boyutu       (-n) */
-    fs_aging_float_t  fill_ratio;     /* hedef doluluk, 0-1 arasi, or. 0.8 (-u)
-                                         FILL hedefe tam ulasana kadar surer;
-                                         hedef ulasilamazsa (or. 1.0'a yakin
-                                         oran, gercek kapasite volume'den
-                                         kucuk) olustur/sil dongusunde
-                                         kalabilir: overwrite_runs ya da
-                                         time_limit_s verin                    */
-    uint32_t          seed;           /* rastgelelik tohumu                (-r) */
-    uint32_t          overwrite_runs; /* toplam yuk = runs * volume_bytes  (-i)
-                                         0 = sinirsiz                          */
-    uint32_t          time_limit_s;   /* 0 = sinirsiz                      (-w) */
-    fs_aging_float_t  confidence;     /* 0 = tam yakinsama beklenir        (-c)
-                                         or. 0.9: yas dagilimi hatasi %10'a
-                                         indiginde durulur                     */
+    const char       *mount_point;    /* mount point without trailing '/',
+                                         e.g. "/fs0"; must stay valid
+                                         during aging                       */
+    uint64_t          volume_bytes;   /* volume size in bytes               */
+    fs_aging_float_t  fill_ratio;     /* fill target, 0..1, e.g. 0.8; if it
+                                         may be unreachable, also set
+                                         overwrite_runs or time_limit_s     */
+    uint32_t          seed;           /* random seed                        */
+    uint32_t          overwrite_runs; /* stop after runs * volume_bytes
+                                         written; 0 = no limit              */
+    uint32_t          time_limit_s;   /* time limit; 0 = no limit           */
+    fs_aging_float_t  confidence;     /* 0 = wait for full convergence;
+                                         e.g. 0.9 stops at 10% age error    */
 } fs_aging_config_t;
 
 /* ------------------------------------------------------------------ */
-/* Dosya kayit havuzu                                                  */
+/* File record pool                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Canli her dosya icin bir kayit (24 byte). Yol saklanmaz, ihtiyac
- * aninda uretilir. Alanlar core'a aittir; cagiran taraf sadece diziyi
- * ayirir. */
+/* One file record per live file. Owned by the library; the caller only
+ * allocates the array. */
 typedef struct {
-    uint64_t birth_tick;   /* olusturuldugu islem numarasi, dosya adi da bu */
-    uint32_t next_free;    /* bos kayitlar listesi                         */
-    uint16_t size_bin;     /* profildeki boyut satiri                      */
-    uint16_t dir_bin;      /* profildeki dizin satiri, bos kayitta 0xFFFF  */
-    uint16_t sibling;      /* kardes dizin numarasi (1..n), yoksa 0        */
+    uint64_t birth_tick;
+    uint32_t next_free;
+    uint16_t size_bin;
+    uint16_t dir_bin;
+    uint16_t sibling;
     uint16_t reserved;
 } fs_aging_file_t;
 
 /* ------------------------------------------------------------------ */
-/* Istatistikler                                                       */
+/* Statistics                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Current phase. */
 typedef enum {
     FS_AGING_PHASE_SETUP = 0,
     FS_AGING_PHASE_FILL,
@@ -207,18 +192,19 @@ typedef enum {
 typedef struct {
     fs_aging_status_t status;
     fs_aging_phase_t  phase;
-    uint64_t          ops;              /* toplam dosya islemi                 */
+    uint64_t          ops;              /* ops in FILL and STABLE; same unit
+                                           as convergence_ops               */
     uint64_t          creates;
     uint64_t          deletes;
-    uint64_t          live_bytes;       /* su an dosya sisteminde duran veri   */
-    uint64_t          workload_bytes;   /* simdiye kadar yazilan toplam veri   */
+    uint64_t          live_bytes;       /* bytes currently on the volume    */
+    uint64_t          workload_bytes;   /* total bytes written so far       */
     uint32_t          live_files;
-    uint64_t          convergence_ops;  /* tam yakinsama icin hedef islem no.  */
-    fs_aging_float_t  age_error;        /* yas dagilimi hatasi, 0-1 arasi      */
-    uint64_t          elapsed_ms;       /* now_ms verilmediyse 0               */
+    uint64_t          convergence_ops;  /* ops needed for full convergence  */
+    fs_aging_float_t  age_error;        /* age distribution error, 0..1     */
+    uint64_t          elapsed_ms;       /* 0 if now_ms is not provided      */
 } fs_aging_stats_t;
 
-/* Dagilim sorgulari icin (orijinaldeki -x / -y / -z ciktilarinin karsiligi) */
+/* Distribution selector for fs_aging_bin_count() / fs_aging_get_bin(). */
 typedef enum {
     FS_AGING_DIST_AGE = 0,
     FS_AGING_DIST_SIZE,
@@ -226,30 +212,30 @@ typedef enum {
 } fs_aging_dist_t;
 
 /* ------------------------------------------------------------------ */
-/* Context - alanlari dogrudan degistirmeyin                           */
+/* Context - internal state, do not modify the fields                  */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    const fs_aging_profile_t *profile;   /* aging boyunca gecerli kalmali */
+    const fs_aging_profile_t *profile;   /* must stay valid during aging */
     fs_aging_config_t         config;
     fs_aging_platform_t       platform;
 
     fs_aging_file_t *pool;
     uint32_t         pool_capacity;
-    uint32_t         pool_high_water;    /* simdiye kadar kullanilan en yuksek slot */
+    uint32_t         pool_high_water;
     uint32_t         free_head;
 
     fs_aging_status_t status;
     fs_aging_phase_t  phase;
-    uint32_t          setup_dir_bin;     /* SETUP asamasi imleci */
+    uint32_t          setup_dir_bin;
     uint32_t          setup_sibling;
-    uint32_t          rebin_active;      /* yas kovasi yerlestirme suruyor  */
-    uint32_t          rebin_cursor;      /* siradaki taranacak havuz kaydi  */
+    uint32_t          rebin_active;
+    uint32_t          rebin_cursor;
 
     uint64_t rng_state;
     uint64_t tick;
-    uint64_t fill_ops;                   /* FILL asamasindaki islem sayisi (K) */
-    uint64_t convergence_tick;           /* tam yakinsama hedefi (T)           */
+    uint64_t fill_ops;
+    uint64_t convergence_tick;
     uint64_t target_live_bytes;
     uint64_t workload_limit_bytes;
     uint64_t start_ms;
@@ -267,7 +253,7 @@ typedef struct {
     uint32_t         count_age [FS_AGING_MAX_BINS];
     uint32_t         count_size[FS_AGING_MAX_BINS];
     uint32_t         count_dir [FS_AGING_MAX_BINS];
-    fs_aging_float_t age_ratio [FS_AGING_MAX_BINS];  /* 1 - esik / en_buyuk_esik */
+    fs_aging_float_t age_ratio [FS_AGING_MAX_BINS];
     uint64_t         age_cutoff_tick[FS_AGING_MAX_BINS];
 
     char path_buf[FS_AGING_PATH_MAX];
@@ -277,8 +263,10 @@ typedef struct {
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Context'i hazirlar, profil ve parametreleri dogrular. Dosya sistemine
- * dokunmaz. Basarida FS_AGING_RUNNING doner. */
+/* Validate the inputs and prepare the context. Does not touch the file
+ * system. profile and config->mount_point must stay valid during aging.
+ * Returns FS_AGING_RUNNING on success, otherwise FS_AGING_ERR_PARAM or
+ * FS_AGING_ERR_PATH_TOO_LONG. */
 fs_aging_status_t fs_aging_init(fs_aging_ctx_t             *ctx,
                                 const fs_aging_profile_t   *profile,
                                 const fs_aging_config_t    *config,
@@ -286,44 +274,30 @@ fs_aging_status_t fs_aging_init(fs_aging_ctx_t             *ctx,
                                 fs_aging_file_t            *pool,
                                 uint32_t                    pool_capacity);
 
-/* En fazla max_ops islem yapar ve doner (SETUP'ta bir islem = bir yaprak
- * dizin, FILL sonundaki yas kovasi yerlestirmede en fazla
- * FS_AGING_REBIN_CHUNK kayit taramasi, diger durumlarda bir dosya
- * olusturma ya da silme). */
+/* Run at most max_ops ops, then return. An op is usually one file create
+ * or delete (one directory in SETUP). */
 fs_aging_status_t fs_aging_step(fs_aging_ctx_t *ctx, uint32_t max_ops);
 
-/* Guncel istatistikleri kopyalar. */
+/* Copy the current statistics. */
 void fs_aging_get_stats(const fs_aging_ctx_t *ctx, fs_aging_stats_t *out);
 
-/* Bir dagilimdaki satir sayisi. */
+/* Number of rows in a distribution. */
 uint32_t fs_aging_bin_count(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist);
 
-/* Bir satirin hedef ve guncel oranlari. Gecersiz index'te -1 doner. */
+/* Target and current share of one row. Returns 0, or -1 for bad
+ * arguments. */
 int fs_aging_get_bin(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist,
                      uint32_t index,
                      fs_aging_float_t *ideal, fs_aging_float_t *actual);
 
-/* FILL asamasi icin guvenli kayit havuzu kapasitesi. 0 ve 0xFFFFFFFF
- * disindaki donen deger dogrudan fs_aging_init()'in pool_capacity'si
- * olarak kullanilabilir; ek %25 pay gerekmez. Yenileme tahmini FILL
- * boyunca her zaman sigan boyutlarla (size_bytes <= volume_bytes -
- * volume_bytes * fill_ratio) ve normal yaklasim yerine negatif olmayan
- * boyutlar icin bir alt kuyruk olasilik siniriyla (delta = 1e-6) yapilir,
- * sonuc kesin bir ust sinirla kirpilir (ayrinti fs_aging.c). FILL'deki en
- * yuksek canli dosya sayisini kapsar (ampirik dogrulama README bolum 5);
- * STABLE'da havuzun dolmasi hata degildir (olusturma yerine silme).
- * 0 doner (gecerli kapasite degil): profile NULL / bos, size_count >
- * FS_AGING_MAX_BINS, fill_ratio (0, 1] disinda ya da agirligi pozitif
- * hicbir boyut volume'e sigmiyor (aging FILL'de FS_AGING_ERR_PLATFORM ile
- * biter).
- * 0xFFFFFFFF doner (gecerli kapasite degil, init reddeder): sonuc 32 bite
- * sigmiyor ya da guvenli sinir yok (volume'e sigan 0 byte'lik boyut var ve
- * FILL boyunca her zaman sigan pozitif boyut yok, or. fill_ratio 1.0). */
+/* Pool capacity needed for this profile and volume. Pass the result
+ * directly as pool_capacity. 0 and 0xFFFFFFFF are not valid capacities:
+ * they mean the inputs cannot be aged. */
 uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
                                  uint64_t volume_bytes,
                                  fs_aging_float_t fill_ratio);
 
-/* Durum kodunun okunabilir karsiligi. */
+/* Short text for a status code. */
 const char *fs_aging_status_str(fs_aging_status_t status);
 
 #ifdef __cplusplus

@@ -1,40 +1,10 @@
 /*
  * fs_aging.c - File system aging core
  *
- * Geriatrix'in (USENIX ATC 2018) islevsel karsiligi. Orijinal algoritmadan
- * bilincli olarak ayrilan noktalar:
+ * A port of Geriatrix (https://github.com/saurabhkadekodi/geriatrix,
+ * BSD-2-Clause). Differences from Geriatrix: see README section 6.
  *
- *  - Rastgele sayilar icin dahili xorshift64* kullanilir; ayni seed her
- *    platformda ayni islem dizisini uretir (orijinalle bire bir eslesmez).
- *  - Silinecek dosya, orijinaldeki gibi en cok fazla temsil edilen yas,
- *    sonra boyut, sonra dizin kovasindan secilir; ancak tum kovalar
- *    taranmak yerine FS_AGING_DELETE_SAMPLES adet rastgele aday arasindan
- *    en iyisi alinir. Bu, islem basina sabit maliyet ve dosya basina
- *    24 byte bellek saglar.
- *  - confidence parametresi, yas dagiliminin toplam varyasyon mesafesine
- *    (0.5 * sum|gercek - hedef|) gore yorumlanir: 0.9 icin hata <= 0.1
- *    oldugunda durulur. Boylece ki-kare CDF'si ve libm gerekmez.
- *  - FILL'den STABLE'a geciste doldurma dosyalari yas kovalarina tek
- *    seferde degil, islem basina FS_AGING_REBIN_CHUNK kayit taranarak
- *    yerlestirilir; tek bir fs_aging_step() suresi havuz boyutundan
- *    bagimsiz kalir. Bu ara islemler tick ve rastgele sayi tuketmez.
- *  - Silinecek dosya yokken silme gerekirse calisma durmaz: STABLE'da
- *    canli dosya yokken yazi-tura silme dese de olusturma yapilir; FILL'de
- *    bos volume'de NO_SPACE alan olusturmanin yerine silme yapilmaz:
- *    volume'den buyuk boyutta islem tuketilir ve sonraki islem yeni bir
- *    boyut ceker, volume'e sigan boyutta ayni islemde en kucuk boyut
- *    denenir. Orijinal bu durumda "Cannot delete a single file of any
- *    size!" basip cikar (geriatrix.cpp:759-762). Yalnizca olusturma
- *    yapilamiyor ve silinecek dosya da yoksa (ilerleme imkansiz)
- *    FS_AGING_ERR_PLATFORM ile durulur. Daha once hata vermeyen yollarda
- *    rastgele sayi tuketimi degismez.
- *  - fs_aging_estimate_files() ortalama boyuttan kaba bir tahmin degil,
- *    FILL icin dogrudan kullanilabilir guvenli bir havuz kapasitesi doner
- *    (FILL boyunca her zaman sigan boyutlar, yenileme icin alt kuyruk
- *    olasilik siniri, kesin ust sinir; ayrinti fonksiyonun ustunde).
- *    Orijinalde boyle bir havuz yoktur.
- *
- * Bu dosya libc kullanmaz.
+ * Does not use libc.
  */
 
 #include "fs_aging.h"
@@ -44,11 +14,11 @@
 #define MAX_SIBLINGS   0xFFFFu
 
 #if (FS_AGING_REBIN_CHUNK) < 1
-#error "FS_AGING_REBIN_CHUNK en az 1 olmali"
+#error "FS_AGING_REBIN_CHUNK must be at least 1"
 #endif
 
 /* ================================================================== */
-/* Yardimcilar                                                         */
+/* Helpers                                                             */
 /* ================================================================== */
 
 static fs_aging_float_t f_abs(fs_aging_float_t x)
@@ -82,7 +52,7 @@ static void log_msg(const fs_aging_ctx_t *c, const char *msg)
     }
 }
 
-/* ---------------- yol olusturma (snprintf yerine) ---------------- */
+/* ---------------- path building ---------------- */
 
 typedef struct {
     char    *buf;
@@ -134,9 +104,8 @@ static void p_u64(path_t *p, uint64_t v)
     }
 }
 
-/* Dizin yolu: <mount>/d1/d2/.../d(k-1)/<yaprak>
- * Yaprak, kardes dizin varsa d<sibling>, yoksa d<k>'dir.
- * levels < k ise sadece ilk 'levels' seviye yazilir (mkdir -p icin). */
+/* Directory path: <mount>/d1/d2/.../<leaf>, cut to the first 'levels'
+ * levels. */
 static void build_dir_path(const fs_aging_ctx_t *c, path_t *p,
                            uint32_t dir_bin, uint32_t sibling, uint32_t levels)
 {
@@ -163,7 +132,7 @@ static void build_file_path(fs_aging_ctx_t *c, path_t *p,
     p_u64(p, f->birth_tick);
 }
 
-/* ---------------- PRNG: splitmix64 tohum + xorshift64* ------------- */
+/* ---------------- random numbers ---------------- */
 
 static void rng_seed(fs_aging_ctx_t *c, uint32_t seed)
 {
@@ -184,7 +153,7 @@ static uint64_t rng_next(fs_aging_ctx_t *c)
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-/* [0, n) araliginda sapmasiz tamsayi, n > 0 */
+/* Uniform integer in [0, n), n > 0 */
 static uint64_t rng_below(fs_aging_ctx_t *c, uint64_t n)
 {
     uint64_t limit = UINT64_MAX - (UINT64_MAX % n);
@@ -195,14 +164,14 @@ static uint64_t rng_below(fs_aging_ctx_t *c, uint64_t n)
     return r % n;
 }
 
-/* [0, 1) araliginda kayan noktali sayi */
+/* Uniform value in [0, 1) */
 static fs_aging_float_t rng_unit(fs_aging_ctx_t *c)
 {
     return (fs_aging_float_t)(rng_next(c) >> 11) * (1.0 / 9007199254740992.0);
 }
 
 /* ================================================================== */
-/* Dagilim yardimcilari                                                */
+/* Distribution helpers                                                */
 /* ================================================================== */
 
 static fs_aging_float_t fraction(const fs_aging_ctx_t *c, uint32_t count)
@@ -225,7 +194,7 @@ static uint32_t age_bin_of(const fs_aging_ctx_t *c, uint64_t birth_tick)
     return n - 1u;
 }
 
-/* Yas dagilimi hatasi: toplam varyasyon mesafesi, 0 (mukemmel) - 1 */
+/* Age distribution error: 0 (perfect) to 1 */
 static fs_aging_float_t age_error(const fs_aging_ctx_t *c)
 {
     fs_aging_float_t sum = 0.0;
@@ -239,7 +208,7 @@ static fs_aging_float_t age_error(const fs_aging_ctx_t *c)
     return 0.5 * sum;
 }
 
-/* En az temsil edilen dizin derinligi */
+/* Most under-represented directory bin */
 static uint32_t pick_dir_bin(const fs_aging_ctx_t *c)
 {
     uint32_t i;
@@ -255,7 +224,7 @@ static uint32_t pick_dir_bin(const fs_aging_ctx_t *c)
     return best;
 }
 
-/* FILL: boyut profil dagilimindan rastgele cekilir */
+/* FILL: random size drawn from the profile */
 static uint32_t pick_size_sampled(fs_aging_ctx_t *c)
 {
     fs_aging_float_t u = rng_unit(c);
@@ -271,7 +240,7 @@ static uint32_t pick_size_sampled(fs_aging_ctx_t *c)
     return n - 1u;
 }
 
-/* STABLE: volume'e sigan, en az temsil edilen boyut. Yoksa NONE_U32. */
+/* STABLE: most under-represented size that fits, or NONE_U32 */
 static uint32_t pick_size_stable(const fs_aging_ctx_t *c)
 {
     uint32_t i;
@@ -292,8 +261,8 @@ static uint32_t pick_size_stable(const fs_aging_ctx_t *c)
     return best;
 }
 
-/* a kaydini silmek b'yi silmekten daha mi iyi? Once yas, sonra boyut,
- * sonra dizin kovasinin fazlaligina bakilir (orijinaldeki oncelik). */
+/* Is record a a better delete candidate than b? Compares age, then size,
+ * then directory over-representation. */
 static int is_better_victim(const fs_aging_ctx_t *c, uint32_t a, uint32_t b)
 {
     const fs_aging_file_t *fa = &c->pool[a];
@@ -342,7 +311,7 @@ static uint32_t pick_victim(fs_aging_ctx_t *c)
     }
 
     if (best == NONE_U32) {
-        /* Havuz cok seyrek: rastgele bir noktadan ilk canli kaydi bul */
+        /* Sparse pool: take the first live record from a random start */
         uint32_t start = (uint32_t)rng_below(c, c->pool_high_water);
         for (n = 0u; n < c->pool_high_water; n++) {
             uint32_t idx = (start + n) % c->pool_high_water;
@@ -356,14 +325,14 @@ static uint32_t pick_victim(fs_aging_ctx_t *c)
 }
 
 /* ================================================================== */
-/* Dosya islemleri                                                     */
+/* File operations                                                     */
 /* ================================================================== */
 
 typedef enum {
     CR_OK = 0,
     CR_NO_SPACE,
     CR_POOL_FULL,
-    CR_FAIL          /* ctx->status hata koduna cekildi */
+    CR_FAIL          /* ctx->status already holds the error */
 } create_result_t;
 
 static void fail(fs_aging_ctx_t *c, fs_aging_status_t st, const char *msg)
@@ -397,7 +366,7 @@ static create_result_t do_create(fs_aging_ctx_t *c, uint32_t size_bin)
 
     build_file_path(c, &p, &rec);
     if (p.overflow != 0) {
-        fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: dosya yolu cok uzun");
+        fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: file path too long");
         return CR_FAIL;
     }
 
@@ -406,7 +375,7 @@ static create_result_t do_create(fs_aging_ctx_t *c, uint32_t size_bin)
         return CR_NO_SPACE;
     }
     if (r != FS_AGING_PLAT_OK) {
-        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: create_file basarisiz");
+        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: create_file failed");
         return CR_FAIL;
     }
 
@@ -439,9 +408,8 @@ static void do_delete(fs_aging_ctx_t *c)
     uint32_t idx = pick_victim(c);
 
     if (idx == NONE_U32) {
-        /* Savunma amacli: cagiranlar yalnizca canli dosya varken siler,
-         * pick_victim() de o durumda her zaman bir kayit bulur. */
-        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: silinecek dosya yok");
+        /* Defensive: callers only delete when live files exist */
+        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: no file to delete");
         return;
     }
     f = &c->pool[idx];
@@ -449,7 +417,7 @@ static void do_delete(fs_aging_ctx_t *c)
     build_file_path(c, &p, f);
     r = c->platform.delete_file(c->platform.user, p.buf);
     if (r != FS_AGING_PLAT_OK) {
-        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: delete_file basarisiz");
+        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: delete_file failed");
         return;
     }
 
@@ -468,10 +436,10 @@ static void do_delete(fs_aging_ctx_t *c)
 }
 
 /* ================================================================== */
-/* Asamalar                                                            */
+/* Phases                                                              */
 /* ================================================================== */
 
-/* SETUP: bir islemde bir yaprak dizin (ve gerekiyorsa ustleri) olusur */
+/* SETUP: one op creates one leaf directory and its parents */
 static void setup_one(fs_aging_ctx_t *c)
 {
     const fs_aging_profile_t *pr = c->profile;
@@ -493,11 +461,11 @@ static void setup_one(fs_aging_ctx_t *c)
             p_init(&p, c->path_buf, FS_AGING_PATH_MAX);
             build_dir_path(c, &p, c->setup_dir_bin, c->setup_sibling, lvl);
             if (p.overflow != 0) {
-                fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: dizin yolu cok uzun");
+                fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: directory path too long");
                 return;
             }
             if (c->platform.make_dir(c->platform.user, p.buf) != FS_AGING_PLAT_OK) {
-                fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: make_dir basarisiz");
+                fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: make_dir failed");
                 return;
             }
         }
@@ -512,11 +480,11 @@ static void setup_one(fs_aging_ctx_t *c)
     }
 
     c->phase = FS_AGING_PHASE_FILL;
-    log_msg(c, "fs_aging: dizin agaci hazir, doldurma basladi");
+    log_msg(c, "fs_aging: directory tree ready, FILL started");
 }
 
-/* Orijinaldeki calculateT(): yas dagiliminin tam oturmasi icin gereken
- * toplam islem sayisi. K = doldurma asamasindaki islem sayisi. */
+/* Total ops needed for the age distribution to converge (Geriatrix
+ * calculateT). K is the number of FILL ops. */
 static uint64_t calc_convergence_tick(const fs_aging_ctx_t *c)
 {
     uint32_t n = c->profile->age_count;
@@ -546,8 +514,7 @@ static uint64_t calc_convergence_tick(const fs_aging_ctx_t *c)
     return (T > 0.0) ? (uint64_t)T : 0u;
 }
 
-/* Doldurma hedefe ulastiginda bir kez: T ve yas esikleri hesaplanir,
- * yas kovasi yerlestirme ara asamasi baslatilir. */
+/* Called once when the fill target is reached: sets up the age bins */
 static void begin_rebin(fs_aging_ctx_t *c)
 {
     uint32_t i;
@@ -563,11 +530,8 @@ static void begin_rebin(fs_aging_ctx_t *c)
     c->rebin_active = 1u;
 }
 
-/* Yas kovasi yerlestirme: doldurma sirasinda olusan dosyalar, islem basina
- * en fazla FS_AGING_REBIN_CHUNK havuz kaydi taranarak yas kovalarina
- * yerlestirilir. Bu islemler tick'i ilerletmez ve rastgele sayi cekmez;
- * bu sirada dosya da olusturulmaz/silinmez, havuz sabit kalir. Ara asama
- * bitene kadar disariya FS_AGING_PHASE_FILL raporlanir. */
+/* Sorts up to FS_AGING_REBIN_CHUNK file records into age bins per op.
+ * No files are created or deleted; the phase stays FILL until done. */
 static void rebin_one(fs_aging_ctx_t *c)
 {
     uint32_t remaining = c->pool_high_water - c->rebin_cursor;
@@ -586,7 +550,7 @@ static void rebin_one(fs_aging_ctx_t *c)
     if (c->rebin_cursor >= c->pool_high_water) {
         c->rebin_active = 0u;
         c->phase = FS_AGING_PHASE_STABLE;
-        log_msg(c, "fs_aging: doldurma bitti, kararli aging basladi");
+        log_msg(c, "fs_aging: FILL done, STABLE started");
     }
 }
 
@@ -598,8 +562,7 @@ static void check_workload(fs_aging_ctx_t *c)
     }
 }
 
-/* Agirligi pozitif en kucuk boyutun satiri (profilde en az bir satirin
- * agirligi pozitiftir, init dogrular). */
+/* Smallest size bin with a positive weight */
 static uint32_t min_size_bin(const fs_aging_ctx_t *c)
 {
     uint32_t best = 0u;
@@ -617,20 +580,9 @@ static uint32_t min_size_bin(const fs_aging_ctx_t *c)
     return best;
 }
 
-/* FILL'de bos volume'de (canli dosya yok) olusturma NO_SPACE aldi;
- * silinecek dosya yoktur. Karar ayni islemde ve kesin verilir:
- *  - Agirligi pozitif en kucuk boyut bile volume'den buyukse hicbir
- *    olusturma basarili olamaz: gercek cikmaz, FS_AGING_ERR_PLATFORM.
- *  - NO_SPACE alan boyut volume'den buyukse (hic sigmaz) islem tuketilir;
- *    sonraki islem yeni bir boyut ceker. Her islemde volume'e sigan bir
- *    boyut pozitif olasilikla cekilir ve asagidaki dallardan biri o
- *    islemde kesin karar verir.
- *  - Boyut volume'e sigdigi halde platform bos volume'de NO_SPACE dondu
- *    (gercek kapasite volume_bytes'tan kucuk): NO_SPACE alan boyut zaten en
- *    kucuk boyutsa gercek cikmazdir; degilse ayni islemde en kucuk boyut
- *    denenir (ikinci create_file). O da NO_SPACE alirsa gercek cikmazdir.
- * Bu yol eskiden her zaman FS_AGING_ERR_PLATFORM ile bitiyordu; daha once
- * hata vermeyen yollarin rastgele sayi tuketimi degismez. */
+/* FILL: a create got NO_SPACE on an empty volume. Skip sizes larger than
+ * the volume, otherwise retry with the smallest size; stop with an error
+ * only when nothing can fit. */
 static void fill_empty_no_space(fs_aging_ctx_t *c, uint32_t size_bin)
 {
     uint32_t min_bin = min_size_bin(c);
@@ -641,19 +593,17 @@ static void fill_empty_no_space(fs_aging_ctx_t *c, uint32_t size_bin)
     if (min_size > c->config.volume_bytes) {
         dead = 1;
     } else if (size > c->config.volume_bytes) {
-        /* Hic sigmayan boyut: islem tuketildi (orijinalden bilincli fark,
-         * dosya basinda) */
+        /* Size never fits: skip this op */
     } else if (size <= min_size) {
         dead = 1;
     } else if (do_create(c, min_bin) == CR_NO_SPACE) {
         dead = 1;
     } else {
-        /* CR_OK: en kucuk boyut olusturuldu. CR_FAIL: durum zaten hata.
-         * CR_POOL_FULL olamaz (canli dosya 0, kapasite en az 1). */
+        /* Created, or status already holds the error */
     }
     if (dead != 0) {
         fail(c, FS_AGING_ERR_PLATFORM,
-             "fs_aging: bos volume'e hicbir profil boyutu sigmiyor");
+             "fs_aging: no profile size fits on the empty volume");
     }
 }
 
@@ -667,7 +617,7 @@ static void fill_one(fs_aging_ctx_t *c)
         return;
     }
     if (c->live_bytes >= c->target_live_bytes) {
-        /* Ilk parca ayni islemde taranir (havuz bossa asama hemen biter) */
+        /* Fill target reached: start sorting into age bins */
         begin_rebin(c);
         rebin_one(c);
         return;
@@ -684,9 +634,9 @@ static void fill_one(fs_aging_ctx_t *c)
         }
     } else if (r == CR_POOL_FULL) {
         fail(c, FS_AGING_ERR_POOL_FULL,
-             "fs_aging: kayit havuzu doldurma icin yetersiz");
+             "fs_aging: pool too small for FILL");
     } else {
-        /* CR_OK veya CR_FAIL: yapacak baska bir sey yok */
+        /* nothing else to do */
     }
 
     if (c->status == FS_AGING_RUNNING) {
@@ -694,22 +644,9 @@ static void fill_one(fs_aging_ctx_t *c)
     }
 }
 
-/* Kararli aging: her islemde 50/50 yazi-tura ile olusturma ya da silme.
- * Orijinaldeki performStableAging (geriatrix.cpp:901-905) gibi doluluk
- * hedefine bakan bir geri besleme yoktur; hedef yalnizca FILL'in sonunu
- * belirler. Bu yuzden canli dosya sayisi (ve onu izleyen canli veri)
- * hedef etrafinda sapmasiz bir rastgele yuruyus yapar ve hedeften
- * sapabilir. Bu orijinal davranistir, bilerek ayni birakildi; sapmayi
- * bir bantla sinirlamak orijinalden sapma olur ve kullanici onayi ister.
- *
- * Canli dosya yokken (sayi rastgele yuruyusle 0'a indiyse) yazi-tura
- * silme dese de olusturma yapilir. Orijinal bu durumda "Cannot delete a
- * single file of any size!" basip cikar (geriatrix.cpp:759-762); bu
- * bilincli bir farktir. Yazi-tura her islemde yine cekilir, boylece daha
- * once hata vermeyen tum yollarda rastgele sayi tuketimi ayni kalir.
- * Olusturma da yapilamiyorsa (volume'e sigan profil boyutu yok, NO_SPACE
- * ya da havuz dolu) ve silinecek dosya yoksa ilerleme imkansizdir:
- * FS_AGING_ERR_PLATFORM ile hemen durulur (sonsuz donguye girilmez). */
+/* STABLE: each op creates or deletes a file with equal chance. Live data
+ * may drift around the fill target, as in Geriatrix. With no live files
+ * a create is done instead of a delete. */
 static void stable_one(fs_aging_ctx_t *c)
 {
     int need_delete = 1;
@@ -725,14 +662,14 @@ static void stable_one(fs_aging_ctx_t *c)
             if ((r == CR_OK) || (r == CR_FAIL)) {
                 need_delete = 0;
             }
-            /* CR_NO_SPACE / CR_POOL_FULL: yerine silme yapilir */
+            /* NO_SPACE or pool full: delete instead */
         }
     }
     if (need_delete != 0) {
         if (c->live_files == 0u) {
             fail(c, FS_AGING_ERR_PLATFORM, (size_bin == NONE_U32)
-                 ? "fs_aging: volume'e sigan profil boyutu yok ve silinecek dosya yok"
-                 : "fs_aging: olusturma NO_SPACE aldi ve silinecek dosya yok");
+                 ? "fs_aging: no profile size fits and no file to delete"
+                 : "fs_aging: create got NO_SPACE and no file to delete");
             return;
         }
         do_delete(c);
@@ -750,12 +687,12 @@ static void stable_one(fs_aging_ctx_t *c)
                (age_error(c) <= (1.0 - c->config.confidence))) {
         c->status = FS_AGING_DONE_TOLERANCE;
     } else {
-        /* devam */
+        /* keep running */
     }
 }
 
 /* ================================================================== */
-/* Dogrulama                                                           */
+/* Validation                                                          */
 /* ================================================================== */
 
 static int validate_profile(const fs_aging_profile_t *pr)
@@ -779,7 +716,7 @@ static int validate_profile(const fs_aging_profile_t *pr)
         }
         if ((i == 0u) ? (pr->ages[0].age_cutoff <= 0.0)
                       : (pr->ages[i].age_cutoff <= pr->ages[i - 1u].age_cutoff)) {
-            return -1;   /* esikler pozitif ve kesin artan olmali */
+            return -1;   /* cutoffs must be positive and increasing */
         }
         total += pr->ages[i].weight;
     }
@@ -812,7 +749,7 @@ static int validate_profile(const fs_aging_profile_t *pr)
     return 0;
 }
 
-/* Profilin uretebilecegi en uzun dosya yolu ('\0' dahil) */
+/* Longest file path the profile can produce, including '\0' */
 static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
 {
     uint32_t best = 0u;
@@ -823,8 +760,7 @@ static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
         uint32_t depth = pr->dirs[i].depth;
         uint32_t len = str_len(mount);
         if (depth > FS_AGING_PATH_MAX) {
-            /* Her seviye en az 3 byte: bu satir hicbir yola sigamaz. Dongu
-             * derinlikle uzamasin ve len tasmasin diye hemen donulur. */
+            /* Too deep to ever fit */
             return FS_AGING_PATH_MAX + 1u;
         }
         if (depth > 0u) {
@@ -833,7 +769,7 @@ static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
             for (lvl = 1u; lvl < depth; lvl++) {
                 len += 2u + u64_digits(lvl);          /* "/d<lvl>"   */
             }
-            len += 2u + u64_digits(leaf);             /* "/d<yaprak>" */
+            len += 2u + u64_digits(leaf);             /* "/d<leaf>"  */
         }
         len += 2u + 20u + 1u;                         /* "/f<tick>\0" */
         if (len > best) {
@@ -843,10 +779,7 @@ static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
     return best;
 }
 
-/* Doldurma hedefi: volume * fill_ratio, uint64_t'ye. volume 2^64'e yakin
- * ve fill_ratio 1 iken carpim 2^64'e yuvarlanabilir; bu degerin uint64_t'ye
- * donusumu tanimsiz davranistir. Bu durumda temsil edilebilen en buyuk
- * double'a (2^64 - 2048) kirpilir. Diger tum girdilerde sonuc degismez. */
+/* Fill target in bytes: volume * fill_ratio, clamped to fit in uint64_t */
 static uint64_t fill_target(uint64_t volume_bytes, fs_aging_float_t fill_ratio)
 {
     fs_aging_float_t x = (fs_aging_float_t)volume_bytes * fill_ratio;
@@ -950,7 +883,7 @@ fs_aging_status_t fs_aging_init(fs_aging_ctx_t             *ctx,
 
     ctx->phase  = FS_AGING_PHASE_SETUP;
     ctx->status = FS_AGING_RUNNING;
-    log_msg(ctx, "fs_aging: init tamam");
+    log_msg(ctx, "fs_aging: init ok");
     return FS_AGING_RUNNING;
 }
 
@@ -1011,8 +944,7 @@ void fs_aging_get_stats(const fs_aging_ctx_t *ctx, fs_aging_stats_t *out)
     out->workload_bytes  = ctx->workload_bytes;
     out->live_files      = ctx->live_files;
     out->convergence_ops = ctx->convergence_tick;
-    /* Yas kovasi yerlestirme yarim kaldiysa (surerken ya da sure siniri
-     * bu sirada dolduysa) sayaclar eksiktir: hata 1.0 raporlanir. */
+    /* Age error is 1.0 until the age bins are ready */
     out->age_error       = ((ctx->convergence_tick != 0u) &&
                             (ctx->rebin_active == 0u)) ? age_error(ctx) : 1.0;
     out->elapsed_ms      = ctx->elapsed_ms;
@@ -1057,15 +989,13 @@ int fs_aging_get_bin(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist,
         break;
     }
     *ideal  = ideals[index];
-    /* Yarim kalan yas kovasi yerlestirmede FILL'deki gibi 0 raporlanir */
+    /* Age bins report 0 until they are ready */
     *actual = ((dist == FS_AGING_DIST_AGE) && (ctx->rebin_active != 0u))
               ? 0.0 : fraction(ctx, counts[index]);
     return 0;
 }
 
-/* Karekok, libm'siz: y >= sqrt(x) baslangicindan Newton adimlari monoton
- * azalir; azalma durunca (ya da en fazla 2048 adim sonunda) durulur.
- * NaN ve x <= 0 icin 0, sonsuz icin sonsuz doner. */
+/* Square root without libm (Newton's method) */
 static fs_aging_float_t f_sqrt(fs_aging_float_t x)
 {
     fs_aging_float_t y;
@@ -1088,44 +1018,12 @@ static fs_aging_float_t f_sqrt(fs_aging_float_t x)
     return y;
 }
 
-/* fs_aging_estimate_files(): ln(1/delta), delta = 1e-6 (yenileme modelinde
- * havuzun yetmeme olasiligi ust siniri) ve sabit pay */
+/* Constants for fs_aging_estimate_files() */
 #define EST_LN_INV_DELTA  13.815510557964274
 #define EST_MARGIN        16.0
 
-/* FILL boyunca ulasilan en yuksek canli dosya sayisi icin guvenli ust
- * tahmin. T = volume * fill_ratio doldurma hedefidir.
- *  - FILL'de olusturma oncesi canli veri T'nin altindadir; bu yuzden
- *    size <= volume - T olan boyutlar FILL boyunca her zaman sigar. Daha
- *    buyuk boyutlar (volume - T < size) ya hic sigmaz ya da yalnizca volume
- *    henuz bosken sigar; sigmadiklarinda NO_SPACE alip silme yaptirirlar.
- *    Ikisi de dosya sayisini yalnizca azaltir. Bu yuzden yenileme tahmini
- *    yalnizca agirligi pozitif ve size <= volume - T olan boyutlarla
- *    yapilir; agirliklar bunlar uzerinde yeniden normalize edilir.
- *  - Yenileme: T'ye ulasmak icin gereken dosya sayisi N, ilk n dosyanin
- *    toplami S_n >= T olan en kucuk n'dir; N > n ancak S_n < T ise olur.
- *    Negatif olmayan bagimsiz boyutlar icin alt kuyruk siniri (Bernstein
- *    tipi, normal yaklasim degil): P(S_n <= n*mu - t) <=
- *    exp(-t^2 / (2 * n * m2)); mu ortalama, m2 = E[size^2]. Bu olasiligi
- *    delta = exp(-L) yapan en kucuk n, n*mu - a*sqrt(n) = T denkleminin
- *    cozumudur (a = sqrt(2 * L * m2)):
- *        sqrt(n) = (a + sqrt(a^2 + 4 * mu * T)) / (2 * mu)
- *    L = EST_LN_INV_DELTA (delta = 1e-6). Sonuca sabit pay eklenir.
- *    (Onceki T/mu + k*sqrt(T*sigma^2/mu^3) dogrusal yaklasimi agir kuyrukta
- *    kucuk T'de yetmiyordu: or. wang_os 16 MB 0.3 seed 1892 gereken 311,
- *    tahmin 301.)
- *  - Agir kuyruklu dagilimlarda m2 cok buyur. Boyutlar bir c esiginde
- *    kirpilirsa (min(size, c)) toplam yalnizca azalir, yani gereken dosya
- *    sayisi ancak artar; her c gecerli bir ust tahmin verir. Bu boyutlarin
- *    her biri c olarak denenir ve en kucuk sonuc alinir.
- *  - Kesin ust sinir: olusturma oncesi canli veri en fazla T - 1 byte'tir
- *    ve her dosya en az s_min (agirligi pozitif, volume'e sigan en kucuk
- *    pozitif boyut) byte'tir; dosya sayisi floor((T - 1) / s_min) + 1'i
- *    gecemez. 0 byte'lik boyut yoksa sonuc bu sinirla kirpilir. size <=
- *    volume - T olan pozitif boyut yoksa (or. fill_ratio 1.0) yalnizca bu
- *    sinir kullanilir; 0 byte'lik boyut da varsa sinir yoktur (0xFFFFFFFF).
- * Profil 48 satirla sinirlidir; maliyet en fazla 48 x (48 + 2048) adimdir
- * (2048: f_sqrt adim siniri, pratikte birkac on adim). */
+/* Returns a pool size that is safe for FILL: a high-probability upper
+ * bound on the number of live files, capped by a hard limit. */
 uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
                                  uint64_t volume_bytes,
                                  fs_aging_float_t fill_ratio)
@@ -1164,11 +1062,11 @@ uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
         } else if (s < min_pos) {
             min_pos = s;
         } else {
-            /* daha kucugu zaten bulundu */
+            /* smaller one already found */
         }
     }
     if (fits == 0u) {
-        return 0u;                 /* hicbir boyut volume'e sigmiyor */
+        return 0u;                 /* no size fits on the volume */
     }
     if ((zero_fits == 0u) && (min_pos != UINT64_MAX)) {
         hard = (t_bytes == 0u) ? 1.0
@@ -1199,7 +1097,7 @@ uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
             m1    += w * x;
             m2    += w * x * x;
         }
-        m1 /= w_sum;               /* cut > 0 ve agirligi pozitif: m1 > 0 */
+        m1 /= w_sum;               /* m1 > 0 here */
         m2 /= w_sum;
         a = f_sqrt(2.0 * EST_LN_INV_DELTA * m2);
         r = (a + f_sqrt((a * a) + (4.0 * m1 * target))) / (2.0 * m1);
@@ -1210,14 +1108,14 @@ uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
     }
 
     if (best >= 0.0) {
-        best += EST_MARGIN + 1.0;  /* +1: tamsayiya yukari yuvarlama */
+        best += EST_MARGIN + 1.0;  /* +1 rounds up */
         if ((hard >= 0.0) && (hard < best)) {
             best = hard;
         }
     } else if (hard >= 0.0) {
-        best = hard;               /* her zaman sigan pozitif boyut yok */
+        best = hard;               /* only the hard limit applies */
     } else {
-        return 0xFFFFFFFFu;        /* sinirsiz: 0 byte'lik boyutlar sigiyor */
+        return 0xFFFFFFFFu;        /* unbounded: 0-byte sizes fit */
     }
     if (!(best < 4294967295.0)) {
         return 0xFFFFFFFFu;
@@ -1228,15 +1126,15 @@ uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
 const char *fs_aging_status_str(fs_aging_status_t status)
 {
     switch (status) {
-    case FS_AGING_RUNNING:             return "fs_aging: calisiyor";
-    case FS_AGING_DONE_CONVERGED:      return "fs_aging: bitti, tam yakinsama";
-    case FS_AGING_DONE_TOLERANCE:      return "fs_aging: bitti, hata toleransa indi";
-    case FS_AGING_DONE_WORKLOAD_LIMIT: return "fs_aging: bitti, yuk sinirina ulasildi";
-    case FS_AGING_DONE_TIME_LIMIT:     return "fs_aging: bitti, sure sinirina ulasildi";
-    case FS_AGING_ERR_PARAM:           return "fs_aging: hata, gecersiz parametre";
-    case FS_AGING_ERR_POOL_FULL:       return "fs_aging: hata, kayit havuzu dolu";
-    case FS_AGING_ERR_PATH_TOO_LONG:   return "fs_aging: hata, yol cok uzun";
-    case FS_AGING_ERR_PLATFORM:        return "fs_aging: hata, platform islemi basarisiz";
-    default:                           return "fs_aging: bilinmeyen durum";
+    case FS_AGING_RUNNING:             return "fs_aging: running";
+    case FS_AGING_DONE_CONVERGED:      return "fs_aging: done, converged";
+    case FS_AGING_DONE_TOLERANCE:      return "fs_aging: done, age error within tolerance";
+    case FS_AGING_DONE_WORKLOAD_LIMIT: return "fs_aging: done, workload limit reached";
+    case FS_AGING_DONE_TIME_LIMIT:     return "fs_aging: done, time limit reached";
+    case FS_AGING_ERR_PARAM:           return "fs_aging: error, invalid parameter";
+    case FS_AGING_ERR_POOL_FULL:       return "fs_aging: error, pool full";
+    case FS_AGING_ERR_PATH_TOO_LONG:   return "fs_aging: error, path too long";
+    case FS_AGING_ERR_PLATFORM:        return "fs_aging: error, platform callback failed";
+    default:                           return "fs_aging: unknown status";
     }
 }
