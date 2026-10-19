@@ -440,9 +440,9 @@ int main(int argc, char **argv)
     cfg.seed = (uint32_t)seed64;
     max_ops  = (uint32_t)maxops64;
 
-    /* Havuz: API'nin onerdigi gibi tahmin + %25 */
+    /* Havuz: dogrudan tahmin (FILL icin guvenli, ek pay yok). 0 ise hicbir
+     * boyut volume'e sigmiyor; init icin en az 1 kayit verilir. */
     cap64 = fs_aging_estimate_files(pr, cfg.volume_bytes, cfg.fill_ratio);
-    cap64 += cap64 / 4u;
     if (cap64 == 0u) {
         cap64 = 1u;
     }

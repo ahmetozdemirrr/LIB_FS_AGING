@@ -98,7 +98,7 @@ Bir projeye eklemek için gereken tek şey: include yolu `CORE/include`, derlene
 | `fs_aging_get_stats(ctx, out)` | İstatistikleri `fs_aging_stats_t` içine kopyalar. |
 | `fs_aging_bin_count(ctx, dist)` | Bir dağılımdaki (yaş/boyut/dizin) satır sayısı. |
 | `fs_aging_get_bin(ctx, dist, index, &ideal, &actual)` | Bir satırın hedef ve gerçek oranı. Geçersiz index veya NULL çıkış pointer'ında `-1` döner. |
-| `fs_aging_estimate_files(profile, volume_bytes, fill_ratio)` | FILL sonunda beklenen yaklaşık dosya sayısı (havuz boyutlandırma için). |
+| `fs_aging_estimate_files(profile, volume_bytes, fill_ratio)` | FILL aşaması için güvenli kayıt havuzu kapasitesi. Doğrudan `pool_capacity` olarak kullanılır, ek pay gerekmez (bkz. [bölüm 5](#5-bellek-boyutlandırma)). `0` (ör. hiçbir boyut volume'e sığmıyor) ve `0xFFFFFFFF` (güvenli sınır yok ya da 32 bite sığmıyor) geçerli kapasite değildir. |
 | `fs_aging_status_str(status)` | Durum kodunun okunabilir (ASCII) metni. |
 | `fs_aging_profile_find(name)` | Hazır profili adıyla bulur (`fs_aging_profiles.h`). Tam ve büyük/küçük harf duyarlı eşleşme yapar; bulunamazsa `NULL` döner. |
 
@@ -107,9 +107,9 @@ Bir projeye eklemek için gereken tek şey: include yolu `CORE/include`, derlene
 Tüm aşamalar `fs_aging_step()` içinde, parça parça ilerler. Güncel aşama `stats.phase` alanında görülür.
 
 1. **SETUP** — Profilin gerektirdiği dizin ağacı oluşturulur. Her işlemde bir yaprak dizin ve gerekiyorsa üst dizinleri oluşturulur.
-2. **FILL** — Volume, `volume_bytes × fill_ratio` canlı veriye ulaşana kadar profil dağılımından rastgele örneklenen boyutlarla doldurulur.
+2. **FILL** — Volume, `volume_bytes × fill_ratio` canlı veriye ulaşana kadar profil dağılımından rastgele örneklenen boyutlarla doldurulur. Oluşturma `NO_SPACE` alırsa yerine bir dosya silinir. Volume'de hiç canlı dosya yoksa silme yapılmaz: boyut volume'den büyükse işlem tüketilir ve sonraki işlem yeni bir boyut çeker; boyut volume'e sığdığı hâlde `NO_SPACE` alındıysa (gerçek kapasite `volume_bytes`'tan küçük) aynı işlemde ağırlığı pozitif en küçük boyut denenir. FILL hedefe tam ulaşana kadar sürer; hedef ulaşılamazsa (ör. `fill_ratio` 1.0'a çok yakın, gerçek kapasite `volume_bytes`'tan küçük ya da boyutlar hedefi tam dolduramıyor) oluştur/sil döngüsünde kalabilir. Bu yüzden böyle durumlarda `overwrite_runs` veya `time_limit_s` verin.
    - **Yaş kovası yerleştirme (ara adım):** Doldurma hedefe ulaşınca, FILL'de oluşan dosyalar her işlemde en fazla `FS_AGING_REBIN_CHUNK` kayıt taranarak yaş kovalarına yerleştirilir. Bu sırada aşama hâlâ `FS_AGING_PHASE_FILL` olarak raporlanır. Dosya oluşturulmaz ya da silinmez; `stats.ops` (tick) ilerlemez ve rastgele sayı çekilmez.
-3. **STABLE** — Her işlemde 50/50 yazı-tura ile oluşturma veya silme yapılır; yaş, boyut ve dizin dağılımları profile yakınsatılır.
+3. **STABLE** — Her işlemde 50/50 yazı-tura ile oluşturma veya silme yapılır; yaş, boyut ve dizin dağılımları profile yakınsatılır. Canlı dosya yoksa yazı-tura silme dese de oluşturma yapılır (orijinalden bilinçli fark, bkz. [bölüm 6](#6-orijinal-geriatrixten-farklar)).
 4. **DONE** — `FS_AGING_RUNNING` dışında bir durumda aşama `FS_AGING_PHASE_DONE` olur.
 
 ### `fs_aging_step()` ve `max_ops` anlamı
@@ -119,9 +119,9 @@ Bir "işlem" (op) aşamaya göre şudur:
 | Aşama | Bir işlem | Bir işlemdeki platform çağrıları |
 |---|---|---|
 | SETUP | Bir yaprak dizin | Yaprak derinliği kadar `make_dir` (kök tarafından başlayarak her seviye için bir kez; `pramod`'da derinlik 36'ya kadar). Tüm dizinler bitince SETUP'tan FILL'e geçiş de bir işlem sayılır ve platform çağrısı yapmaz. |
-| FILL | Bir dosya oluşturma | Bir `create_file`. `NO_SPACE` dönerse aynı işlemde bir `delete_file`. |
+| FILL | Bir dosya oluşturma | Bir `create_file`. `NO_SPACE` dönerse ve canlı dosya varsa aynı işlemde bir `delete_file`. Canlı dosya yoksa: boyut volume'den büyükse başka çağrı yapılmaz (işlem tüketilir); boyut volume'e sığıyorsa ve en küçük boyut değilse aynı işlemde en küçük boyutla ikinci bir `create_file` (en fazla 2 çağrı). |
 | FILL (yaş kovası yerleştirme) | En fazla `FS_AGING_REBIN_CHUNK` havuz kaydının taranması | Yok |
-| STABLE | Bir oluşturma veya silme | Bir `create_file` ya da bir `delete_file`. Oluşturma yapılamazsa (volume'e sığan boyut yok, `NO_SPACE` döndü ya da kayıt havuzu dolu) aynı işlemde bir `delete_file`. Silme gerektiğinde hiç canlı dosya yoksa platform çağrısı yapılmaz ve çalışma `FS_AGING_ERR_PLATFORM` ile biter (bkz. durum kodları). |
+| STABLE | Bir oluşturma veya silme | Bir `create_file` ya da bir `delete_file`. Canlı dosya yoksa yazı-tura sonucundan bağımsız olarak oluşturma denenir. Oluşturma yapılamazsa (volume'e sığan boyut yok, `NO_SPACE` döndü ya da kayıt havuzu dolu) aynı işlemde bir `delete_file`. Oluşturma yapılamıyor ve hiç canlı dosya da yoksa (gerçek çıkmaz) silme çağrısı yapılmaz ve çalışma `FS_AGING_ERR_PLATFORM` ile hemen biter (bkz. durum kodları). |
 
 - Böylece tek bir `fs_aging_step()` çağrısının süresi `max_ops × (en pahalı tek işlem)` ile sınırlıdır ve havuz boyutundan bağımsızdır. Tek istisna, havuz çok seyrekken silinecek dosya arayan yedek taramadır. Bu durum pratikte görülmez.
 - **Adım bağımsızlığı:** Sonuç `max_ops` değerinden bağımsızdır. Aynı seed ile `max_ops=1` ve `max_ops=1000` aynı işlem dizisini ve aynı istatistikleri üretir. Tek fark, süre sınırının yalnızca her `fs_aging_step()` çağrısının sonunda kontrol edilmesidir.
@@ -142,7 +142,7 @@ Bir "işlem" (op) aşamaya göre şudur:
 | `FS_AGING_ERR_PARAM` | `init` doğrulaması başarısız ya da `ctx == NULL` | Geçersiz profil, config veya platform (ayrıntı aşağıda). |
 | `FS_AGING_ERR_POOL_FULL` | **FILL** sırasında canlı dosya sayısı havuz kapasitesine ulaştı | Havuz küçük. STABLE'da havuzun dolması hata değildir (bkz. [bölüm 5](#5-bellek-boyutlandırma)). |
 | `FS_AGING_ERR_PATH_TOO_LONG` | `init`'te profilin en uzun yolu `FS_AGING_PATH_MAX`'ı aşıyor | `FS_AGING_PATH_MAX`'ı büyütün veya mount point'i kısaltın. |
-| `FS_AGING_ERR_PLATFORM` | Bir callback hata döndü; ya da silme gerekiyor ama hiç canlı dosya yok | Aging durur. İkinci durum callback hatası olmadan da oluşur (log: `"fs_aging: volume dolu ve silinecek dosya yok"`): (a) FILL'in ilk oluşturması `NO_SPACE` alırsa, (b) STABLE'da canlı dosya sayısı rastgele yürüyüşle 0'a inip yazı-tura silme derse. (b) küçük volume'lerde ve uzun çalışmalarda olasıdır (ör. `host_test agrawal 16777216 0 42`: 2655 işlemde canlı dosya 0, volume boş). Bu davranışın değiştirilmesi (ör. canlı dosya yokken silme yerine oluşturma) kullanıcı kararı bekliyor. |
+| `FS_AGING_ERR_PLATFORM` | Bir callback hata döndü; ya da hiçbir boyut oluşturulamıyor ve silinecek dosya da yok (gerçek çıkmaz) | Aging durur. Canlı dosya yokken silme gerekmesi tek başına hata **değildir**: STABLE'da oluşturma yapılır, FILL'de `NO_SPACE` alan işlem silmeden tüketilir. Çıkmaz yalnızca şu durumlarda callback hatası olmadan oluşur ve çalışma takılmadan biter: (a) FILL'de volume boşken `NO_SPACE` alındı ve ağırlığı pozitif en küçük boyut bile volume'den büyük, ya da volume'e sığan bir boyut `NO_SPACE` aldı ve en küçük boyut da (aynı işlemde denenir) `NO_SPACE` aldı (log: `"fs_aging: bos volume'e hicbir profil boyutu sigmiyor"`). Bu karar `NO_SPACE`'in alındığı işlemde verilir; yalnızca volume'den büyük bir boyut çekildiyse işlem tüketilir ve karar volume'e sığan bir boyut çekilen ilk işlemde verilir; (b) STABLE'da canlı dosya yok ve volume'e sığan profil boyutu yok (log: `"fs_aging: volume'e sigan profil boyutu yok ve silinecek dosya yok"`) ya da oluşturma `NO_SPACE` aldı (log: `"fs_aging: olusturma NO_SPACE aldi ve silinecek dosya yok"`). Ağırlığı pozitif hiçbir boyutu volume'e sığmayan profil için `fs_aging_estimate_files()` `0` döner. |
 
 `fs_aging_init()` şu durumlarda `FS_AGING_ERR_PARAM` döner:
 
@@ -178,7 +178,7 @@ void my_log(void *user, const char *msg);
 
 #define VOLUME_BYTES (1024ull * 1024u * 1024u)   /* 1 GB */
 #define FILL_RATIO   0.8
-#define POOL_CAP     12000u     /* agrawal, 1 GB: tahmin 7515 + %25 = 9393, yuvarlandi */
+#define POOL_CAP     10500u     /* agrawal, 1 GB, 0.8: tahmin 10494, yuvarlandi */
 
 static fs_aging_file_t pool[POOL_CAP];   /* 24 B/kayit */
 static fs_aging_ctx_t  ctx;              /* boyut host'ta 3008 B */
@@ -197,10 +197,10 @@ int run_aging(void)
         return -1;
     }
 
-    /* Havuz kapasitesi: tahmin + %25 pay */
+    /* Havuz kapasitesi: tahmin dogrudan kullanilir (ek pay gerekmez).
+     * 0: hicbir profil boyutu volume'e sigmiyor. */
     need = fs_aging_estimate_files(pr, VOLUME_BYTES, FILL_RATIO);
-    need += need / 4u;
-    if (need > POOL_CAP) {
+    if ((need == 0u) || (need > POOL_CAP)) {
         return -1;
     }
 
@@ -255,7 +255,7 @@ int run_aging(void)
 |---|---|---|
 | `mount_point` | `-m` | Sonunda `/` olmadan, ör. `"/fs0"`. Pointer saklanır, aging boyunca geçerli kalmalıdır. |
 | `volume_bytes` | `-n` | Dosya sisteminin toplam boyutu (byte). |
-| `fill_ratio` | `-u` | Hedef doluluk, (0, 1] aralığında, ör. `0.8`. |
+| `fill_ratio` | `-u` | Hedef doluluk, (0, 1] aralığında, ör. `0.8`. 1.0'a çok yakın değerlerde FILL hedefe ulaşamayıp oluştur/sil döngüsünde kalabilir; bu durumda `overwrite_runs` veya `time_limit_s` verin. |
 | `seed` | `-r` | Rastgelelik tohumu. |
 | `overwrite_runs` | `-i` | Toplam yük sınırı `overwrite_runs × volume_bytes`. 0 = sınırsız. |
 | `time_limit_s` | `-w` | Süre sınırı, **saniye** cinsinden (orijinalde dakika). 0 = sınırsız. `now_ms` gerekir. |
@@ -267,43 +267,69 @@ int run_aging(void)
 
 **Dosya kayıt havuzu (`fs_aging_file_t[]`).** Canlı her dosya için bir kayıt tutulur. Kayıt boyutu **24 byte**'tır: 20 byte alan (`uint64_t` + `uint32_t` + 4 × `uint16_t`) + 8 byte hizalama için 4 byte dolgu (host'ta `sizeof` ile doğrulandı; farklı hizalamalı ABI'lerde hedefte `sizeof` ile ölçün). Yol saklanmaz, ihtiyaç anında üretilir.
 
-- Kapasite `fs_aging_estimate_files(profile, volume_bytes, fill_ratio)` ile tahmin edilir. Bu değer `volume × fill_ratio / ortalama_boyut + 1`'dir. Üzerine **%25 pay** eklenmesi önerilir: `cap = est + est / 4`.
+- Kapasite `fs_aging_estimate_files(profile, volume_bytes, fill_ratio)` ile bulunur. Dönen değer FILL aşaması için **doğrudan `pool_capacity` olarak kullanılır; ek %25 pay gerekmez.** Güvenlik iki parçalıdır: kesin bir üst sınır (aşağıda 4. adım) ve yenileme modelinde havuzun yetmeme olasılığını `10⁻⁶` ile sınırlayan bir olasılık sınırı (2. adım). Model, FILL'deki `NO_SPACE` + silme etkileşimini ve silinecek dosya seçimini kesin olarak kapsamaz (bunların dosya sayısını yalnızca azalttığı varsayılır); bu yüzden sonuç ayrıca aşağıdaki geniş ampirik doğrulamayla sınandı ve hiç aşılmadı.
+- `0` döner (geçerli kapasite değildir): hiçbir boyut volume'e sığmıyorsa, `profile` NULL/boş ise, `size_count > FS_AGING_MAX_BINS` ise ya da `fill_ratio` (0, 1] dışında ise.
+- `0xFFFFFFFF` döner (geçerli kapasite değildir; `fs_aging_init()` reddeder): sonuç 32 bite sığmıyorsa ya da güvenli sınır yoksa. İkincisi, volume'e sığan 0 byte'lık bir boyut varken FILL boyunca her zaman sığan pozitif boyut olmadığında olur (ör. `meyer` veya `wang_os` ile `fill_ratio` 1.0).
 - ARINC 653'te havuz statik bir dizidir; boyutu partition bellek bütçesine göre derleme zamanında seçilir.
 
 **Context (`fs_aging_ctx_t`).** Bu host'ta (x86_64, MSYS2 UCRT64 gcc 16.2, varsayılan limitler) `sizeof(fs_aging_ctx_t) = 3008` byte'tır. Bu sayı **host'a özeldir**: pointer boyutu, hizalama ve `FS_AGING_MAX_BINS` / `FS_AGING_PATH_MAX` değerleri değiştikçe değişir. Hedef platformda `sizeof` ile ölçün. Context'in alanları dahilidir ve değiştirilmemelidir.
 
-### Büyük dosya boyutlu profiller
+### `fs_aging_estimate_files()` nasıl hesaplar
 
-Bazı profillerde volume'e hiç sığmayan çok büyük boyut satırları vardır: `dabre` ve `grundman` 2 GiB, `pramod` 32 GiB dosya içerir. `fs_aging_estimate_files()` bu satırları ortalamaya kattığı için ortalama boyutu büyük, dosya sayısını küçük tahmin eder. Gerçekte bu boyutlar FILL'de `NO_SPACE` alır ve canlı dosyalar küçük boyutlardan oluşur. Sonuçta gereken kayıt sayısı tahminin çok üstüne çıkabilir.
+Havuz ihtiyacı, **STABLE'a geçmeden önce (FILL boyunca) ulaşılan en yüksek canlı dosya sayısıdır.** STABLE'da havuzun dolması hata değildir (aşağıya bakın). Tahmin libm kullanmaz (karekök en fazla 2048 adımlık bir Newton döngüsüyle alınır, pratikte birkaç on adım), özyineleme yoktur, maliyeti en fazla 48 × (48 + 2048) adımdır.
 
-Aşağıdaki değerler **yalnızca seed 42** ve `fill_ratio` 0.8 ile, sahte bir platformda (yalnızca canlı byte takibi) ölçüldü. Ölçüm deterministiktir, ama başka seed'lerde tepe değerleri belirgin biçimde farklı olabilir (aşağıya bakın):
+1. **FILL boyunca her zaman sığan boyutlar:** FILL'de her oluşturmadan önce canlı veri hedef `T = volume × fill_ratio`'nun altındadır; bu yüzden `size_bytes <= volume − T` olan boyutlar FILL boyunca her zaman sığar. Ağırlığı pozitif bu boyut satırları alınır, ağırlıklar bunlar üzerinde yeniden normalize edilir. Daha büyük boyutlar ya hiç sığmaz (ör. `pramod`'daki 32 GiB) ya da yalnızca volume henüz boşken sığar (`volume − T < size <= volume`); sığmadıklarında `NO_SPACE` alıp yerine silme yaptırırlar. İkisi de dosya sayısını yalnızca azaltır. Eski tahmin bunları ortalamaya katıyor ve dosya sayısını çok küçük buluyordu. (Önceki taslak `size <= volume` alıyordu; ör. `pramod` 16 MB 0.95 seed 849 ve `wang_os` 4 MB 0.8 seed 152 bu yüzden `POOL_FULL` veriyordu.)
+2. **Yenileme, olasılık sınırıyla:** Hedef `T`'ye ulaşmak için gereken dosya sayısı `N`, ilk `n` dosyanın toplamı `S_n ≥ T` olan en küçük `n`'dir; `N > n` ancak `S_n < T` ise olur. Negatif olmayan bağımsız boyutlar için normal yaklaşım gerektirmeyen bir alt kuyruk sınırı vardır: `P(S_n ≤ n·μ − t) ≤ exp(−t² / (2·n·m₂))` (μ ortalama, `m₂ = E[size²]`; etkin boyut dağılımı üzerinden). Bu olasılığı `δ = 10⁻⁶` yapan en küçük `n`, `n·μ − a·√n = T` denkleminin çözümüdür (`a = sqrt(2·ln(1/δ)·m₂)`): `√n = (a + sqrt(a² + 4·μ·T)) / (2·μ)`. Tahmin `n + 17`'dir (16 sabit pay + yukarı yuvarlama için 1; sonuç tamsayıya aşağı yuvarlanır). Önceki taslaktaki `T/μ + k·sqrt(T·σ²/μ³)` doğrusal yaklaşımı, ağır kuyruklu profillerde küçük `T`'de `a²/(4μ²)` mertebesindeki terimi atlıyordu ve yetmiyordu (ör. `wang_os` 16 MB 0.3 seed 1892: gereken 311, tahmin 301).
+3. **Kırpma (ağır kuyruklu profiller):** Boyutlar bir `c` eşiğinde kırpılırsa (`min(size, c)`) toplam yalnızca azalır, dolayısıyla gereken dosya sayısı ancak artar; her `c` için hesaplanan değer geçerli bir üst sınırdır (aynı `δ` ile). 1. adımdaki her boyut `c` olarak denenir ve en küçük sonuç alınır. Bu, birkaç çok büyük dosyanın `m₂`'yi şişirdiği `dabre`, `grundman`, `pramod` gibi profillerde havuzu belirgin biçimde küçültür.
+4. **Kesin üst sınır:** Oluşturmadan önce canlı veri en fazla `T − 1` byte'tır ve her dosya en az `s_min` byte'tır (`s_min`: ağırlığı pozitif, volume'e sığan en küçük pozitif boyut). Bu yüzden FILL'de dosya sayısı `floor((T − 1) / s_min) + 1`'i geçemez. Volume'e sığan 0 byte'lık boyut yoksa sonuç bu sınırla kırpılır (ör. tek boyutlu profillerde tahmin tam bu değerdir). 1. adımda hiç pozitif boyut kalmazsa (ör. `fill_ratio` 1.0) yalnızca bu sınır kullanılır; 0 byte'lık boyut da varsa sınır yoktur ve `0xFFFFFFFF` döner.
 
-| Profil | 256 MB tahmin | +%25 | FILL tepe | Tüm çalışma tepe | 1 GB tahmin | +%25 | FILL tepe | Tüm çalışma tepe |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| agrawal | 1879 | 2348 | 2024 | 2050 | 7515 | 9393 | 7417 | 7550 |
-| dabre | 2354 | 2942 | **5152** | 5166 | 9413 | 11766 | **15738** | 15790 |
-| douceur | 4766 | 5957 | 5142 | **8009** | 19063 | 23828 | 18790 | 19860 |
-| grundman | 1838 | 2297 | 966 | 1000 | 7349 | 9186 | 7137 | 7227 |
-| meyer | 434 | 542 | 480 | 503 | 1733 | 2166 | 1336 | 1381 |
-| pramod | 674 | 842 | **1049** | 1049 | 2695 | 3368 | **4420** | 4438 |
-| wang_lanl | 918 | 1147 | 937 | 1031 | 3670 | 4587 | 3652 | 4404 |
-| wang_os | 2344 | 2930 | 2627 | **3024** | 9376 | 11720 | 9720 | 10704 |
+**Doğrulama** (sahte platform, yalnızca FILL, havuz = tahmin, **ek pay yok**). Ölçülen değer "gereken en küçük havuz"dur: FILL'deki oluşturma denemelerinde `canlı dosya + 1`'in en büyüğü (havuz bundan küçükse `POOL_FULL` olur). Sahte platform dosya tablosu tutmaz, kapasiteyi çekirdeğin canlı veri sayacıyla karşılaştırır; tablo taşması olmadığından atlanan kombinasyon yoktur.
 
-Bu tablodan çıkan sonuçlar:
+- Ana ızgara: 8 profil × seed 1–200 × volume {16 MB, 64 MB, 256 MB, 1 GB, 4 GB} × `fill_ratio` {0.5, 0.8, 0.95} = 24000 çalışma. Hiçbirinde `FS_AGING_ERR_POOL_FULL` oluşmadı.
+- Izgara dışı: seed 1–3000 × volume {1, 2, 4, 8, 16} MB × `fill_ratio` {0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99} (8 profil, 960000 çalışma) ve seed 201–1000 × {64, 256} MB × {0.5, 0.8, 0.95} (38400 çalışma). Hiçbirinde `POOL_FULL` oluşmadı; en yüksek "gereken / tahmin" oranı küçük volume'lerde 0,775 (`dabre` 16 MB 0.9 seed 444: 1563 / 2017), 64/256 MB'ta 0,868 (`wang_lanl` 256 MB 0.95 seed 288: 1213 / 1398). Önceki taslaklarda `POOL_FULL` veren `pramod` 16 MB 0.95 seed 849 (gereken 965, tahmin 1844), `wang_os` 4 MB 0.8 seed 152 (258 / 494) ve `wang_os` 16 MB 0.3 seed 1892 (311 / 536) artık geçer.
+- `fill_ratio` 1.0 ızgarada yoktur: FILL bu oranda hedefe ulaşamayıp oluştur/sil döngüsünde kalabilir; tahmin orada yalnızca 4. adımdaki kesin sınırdır.
 
-- **FILL'de** havuz dolarsa sonuç `FS_AGING_ERR_POOL_FULL` olur. Seed 42'de `dabre` ve `pramod` için %25 pay **yetmez**. Başka seed'lerde büyük boyut satırı olan diğer profiller de aşar. `host_test` ile (havuz = tahmin + %25) ölçülen örnekler:
-  - `agrawal` 256 MB seed 8: `ERR_POOL_FULL`, 2349 işlem.
-  - `meyer` 1 GB, seed 1–8: seed 3, 4 ve 8'de `ERR_POOL_FULL` (2167 işlem), diğer 5 seed'de tam yakınsama.
-  - `grundman` 1 GB seed 3: `ERR_POOL_FULL`, 9187 işlem.
-  - `douceur` 64 MB seed 4: `ERR_POOL_FULL`, 1491 işlem.
+Ana ızgarada profil başına en yüksek "gereken havuz / tahmin" oranı:
 
-  Bu yüzden %25 pay yalnızca küçük boyutlu profiller için güvenlidir. Büyük boyut satırı olan profillerde (`agrawal`, `dabre`, `douceur`, `grundman`, `meyer`, `pramod`) havuzu belirgin biçimde büyük seçin (ör. tahminin 2,5 katı) ya da kullanılacak seed'lerin hepsiyle tepe değerini ölçün. Tahmin fonksiyonunun kendisinin değiştirilmesi kullanıcı kararı bekliyor.
-- **STABLE'da** havuz dolarsa hata oluşmaz: oluşturma yerine silme yapılır. Ancak bu, canlı dosya sayısına bir üst sınır koyar ve dağılımları etkileyebilir. Bu yüzden havuzu "tüm çalışma tepe" sütununun üstünde tutmak en iyisidir (ör. `douceur` 256 MB'ta 8009 > 5957).
-- Hedef platform için kesin değer gerekiyorsa aynı profil, volume ve seed ile host testinde tepe değerini ölçün.
+| Profil | En yüksek gereken / tahmin | En kötü durum (volume, fill, seed: gereken / tahmin) |
+|---|---:|---|
+| agrawal | 0,934 | 4 GB, 0.8, 177: 33168 / 35530 |
+| dabre | 0,743 | 1 GB, 0.8, 39: 31119 / 41870 |
+| douceur | 0,952 | 4 GB, 0.95, 18: 95781 / 100657 |
+| grundman | 0,767 | 1 GB, 0.8, 174: 17381 / 22660 |
+| meyer | 0,774 | 4 GB, 0.8, 118: 10028 / 12951 |
+| pramod | 0,728 | 4 GB, 0.95, 118: 33092 / 45441 |
+| wang_lanl | 0,961 | 4 GB, 0.95, 29: 17801 / 18517 |
+| wang_os | 0,935 | 4 GB, 0.8, 81: 40474 / 43272 |
+
+Tahminler (`fill_ratio` 0.8) ve 200 seed'de ölçülen en büyük gereken havuz. "Eski" önceki `volume × fill_ratio / ortalama_boyut + 1` tahminidir; bellek maliyeti kayıt başına 24 byte'tır:
+
+| Profil | 256 MB eski | eski +%25 | **yeni** | yeni / eski | 200 seed gereken | 1 GB eski | eski +%25 | **yeni** | yeni / eski | 200 seed gereken |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| agrawal | 1879 | 2348 | **3636** | ×1,94 | 2498 | 7515 | 9393 | **10494** | ×1,40 | 8985 |
+| dabre | 2354 | 2942 | **13990** | ×5,94 | 9808 | 9413 | 11766 | **41870** | ×4,45 | 31119 |
+| douceur | 4766 | 5957 | **7305** | ×1,53 | 5706 | 19063 | 23828 | **24007** | ×1,26 | 21054 |
+| grundman | 1838 | 2297 | **8190** | ×4,46 | 5545 | 7349 | 9186 | **22660** | ×3,08 | 17381 |
+| meyer | 434 | 542 | **2155** | ×4,97 | 1140 | 1733 | 2166 | **4851** | ×2,80 | 3050 |
+| pramod | 674 | 842 | **5810** | ×8,62 | 3143 | 2695 | 3368 | **14052** | ×5,21 | 8637 |
+| wang_lanl | 918 | 1147 | **1205** | ×1,31 | 1006 | 3670 | 4587 | **4195** | ×1,14 | 3822 |
+| wang_os | 2344 | 2930 | **4136** | ×1,76 | 3008 | 9376 | 11720 | **12480** | ×1,33 | 10764 |
+
+- Büyük artış, eski tahminin gerçekten yetmediği profillerdedir. Bu profillerde FILL tepesi seed'e göre çok değişir (ör. `dabre` 256 MB: 200 seed'de 1303–9808); güvenli kapasite bu yayılımı kapsamak zorundadır.
+- Hafif profillerde (`wang_lanl`, `douceur` 1 GB, `wang_os` 1 GB) yeni değer eski "+%25" değerine yakın ya da ondan küçüktür.
+- Küçük volume'lerde oran daha büyüktür (sabit pay ve olasılık sınırındaki `a²/(4μ²)` terimi `T`'den bağımsızdır); ör. 16 MB, 0.8'de yeni tahmin eski tahminin 2,7 (`wang_lanl`: 58 → 156) ile 34 (`pramod`: 43 → 1474) katıdır; buna karşın en büyüğü 1815 kayıttır (`dabre`, ~43 KB). Bellek sorun olursa `fill_ratio` ve volume için `fs_aging_estimate_files()` değeri derleme öncesinde hesaplanıp havuz tam o boyutta seçilmelidir.
+
+### STABLE'da havuzun dolması
+
+STABLE'da canlı dosya sayısı FILL tepesinin üstüne çıkabilir (sapmasız rastgele yürüyüş, bkz. [bölüm 6](#6-orijinal-geriatrixten-farklar)). Havuz bu aşamada dolarsa **hata oluşmaz**: oluşturma yerine silme yapılır (canlı dosya sayısı havuz kapasitesine eşit olduğundan silinecek dosya her zaman vardır). Bu yalnızca canlı dosya sayısına bir üst sınır koyar. Ancak işlem dizisini değiştirir: havuz kapasitesi farklıysa aynı seed STABLE'da farklı sonuç verebilir. Ör. seed 42 ile `wang_os` 256 MB'ta eski havuz (2930) STABLE'da 148 adımda doluydu, yeni havuzla (4136) hiç dolmuyor (en yüksek canlı dosya 3024); `douceur` 64 MB'ta eski havuz (1490) 4517 adımda, yeni havuz (2432) 909 adımda dolu. STABLE'ın havuz sınırına hiç takılmaması isteniyorsa, aynı profil, volume ve seed ile host testinde tüm çalışmanın tepe değeri ölçülüp havuz onun üstünde seçilebilir.
+
+### Eski tahminle görülen `ERR_POOL_FULL` örnekleri
+
+Eski tahmin (ortalama boyuttan, önerilen +%25 payla) şu çalışmalarda FILL'de `FS_AGING_ERR_POOL_FULL` veriyordu: `agrawal` 256 MB seed 8; `meyer` 1 GB seed 3, 4, 8; `grundman` 1 GB seed 3; `douceur` 64 MB seed 4; `dabre` ve `pramod` birçok volume'de (ör. seed 42 ile 256 MB ve 1 GB'ta; volume'e sığmayan 2 GiB / 32 GiB'lık boyutlar ortalamayı şişiriyordu). Yeni tahmin bu örneklerin hepsini yukarıdaki 24000 çalışmalık doğrulamada kapsar (aynı seed'ler 1–200 aralığındadır).
 
 ## 6. Orijinal Geriatrix'ten farklar
 
-Bilinçli farklar (çekirdekle ilgili olanların bir kısmı — PRNG, silinecek dosya seçimi, `confidence` ve yaş kovası yerleştirme — `fs_aging.c` başında da yazılıdır; kararlı aşamadaki sapma notu `stable_one()` üstündedir):
+Bilinçli farklar (çekirdekle ilgili olanların bir kısmı — PRNG, silinecek dosya seçimi, `confidence`, yaş kovası yerleştirme, silinecek dosya yokken davranış ve havuz tahmini — `fs_aging.c` başında da yazılıdır; kararlı aşamadaki sapma notu `stable_one()` üstündedir):
 
 - **PRNG:** Dahili xorshift64* kullanılır (seed splitmix64 ile karıştırılır). Aynı seed her platformda aynı işlem dizisini üretir. Ancak orijinalle bire bir aynı dizi üretilmez.
 - **Silinecek dosya seçimi:** Öncelik orijinaldeki gibidir: en çok fazla temsil edilen yaş kovası, sonra boyut kovası, sonra dizin kovası. Fark şudur: tüm kovalar taranmaz, `FS_AGING_DELETE_SAMPLES` (32) rastgele aday arasından en iyisi seçilir. Bu sayede işlem başına maliyet sabit kalır ve dosya başına 24 byte yeter.
@@ -312,8 +338,10 @@ Bilinçli farklar (çekirdekle ilgili olanların bir kısmı — PRNG, silinecek
 - **Yaş kovası yerleştirme:** FILL'den STABLE'a geçişte havuz tek seferde taranmaz. Her işlemde `FS_AGING_REBIN_CHUNK` kayıt taranır. Bu ara işlemler tick ve rastgele sayı tüketmez; bu yüzden işlem dizisi tek seferlik taramayla aynıdır.
 - **Olmayan seçenekler:** Çok thread (`-t`) ve boşta bekleme (`-p`) yoktur. `-q` (bitişte sorma) ve `-x/-y/-z` (dağılım dosyaları) port'un işidir; çekirdek bunlar için `fs_aging_get_bin()` sunar. Sahte mod (`-f`) yerine host testlerindeki sahte platform kullanılır. Backend seçimi (`-b`) yerine `fs_aging_platform_t` vardır.
 - **Süre sınırı:** `time_limit_s` saniye cinsindendir (orijinal `-w` dakika).
-- **Yer yetersizliği:** Orijinal, `fallocate` başarısız olunca bekleyip aynı dosyayı tekrar dener. Burada platform `FS_AGING_PLAT_NO_SPACE` dönerse çekirdek aynı işlemde bir dosya siler ve devam eder.
+- **Yer yetersizliği:** Orijinal, `fallocate` başarısız olunca bekleyip aynı dosyayı tekrar dener. Burada platform `FS_AGING_PLAT_NO_SPACE` dönerse çekirdek aynı işlemde bir dosya siler ve devam eder (canlı dosya yoksa silmez, bir sonraki maddeye bakın).
+- **Silinecek dosya yokken ("dosya yoksa silmek yerine oluştur"):** Orijinal, silinecek dosya bulamazsa `"Cannot delete a single file of any size!"` basıp `exit(1)` ile çıkar (`geriatrix.cpp:759-762`). Burada çalışma durmaz: STABLE'da canlı dosya yokken yazı-tura silme dese de oluşturma yapılır; FILL'de volume boşken `NO_SPACE` alan oluşturmanın yerine silme denenmez: boyut volume'den büyükse işlem tüketilir ve sonraki işlem yeni bir boyut çeker; volume'e sığan bir boyutsa aynı işlemde en küçük boyut denenir. Yalnızca oluşturma yapılamıyor ve silinecek dosya da yoksa (gerçek çıkmaz) `FS_AGING_ERR_PLATFORM` ile durulur. Karar, volume'e sığan bir boyutun denendiği ilk işlemde verilir; çalışma takılmaz (bkz. [durum kodları](#durum-kodları-fs_aging_status_t)). Yazı-tura her işlemde yine çekilir; daha önce hata vermeyen yollarda rastgele sayı tüketimi ve işlem dizisi değişmedi (ör. Agrawal 256 MB referans sonucu aynıdır). Önceden hata veren örnekler artık tamamlanır: `host_test agrawal 16777216 0 42` (eskiden 2655. işlemde `ERR_PLATFORM`) 4768 işlemde `DONE_CONVERGED`, `host_test douceur 67108864 0 3` `DONE_CONVERGED` ile biter.
 - **Kayıt havuzu sınırı:** STABLE'da havuz doluysa oluşturma yerine silme yapılır (orijinalde böyle bir sınır yoktur). Bu yalnızca yukarı yönde bir sınırdır.
+- **Havuz tahmini:** Orijinal dosya kayıtlarını dinamik bellekte tutar. Burada havuz çağıran taraftan gelir; `fs_aging_estimate_files()` FILL için güvenli kapasiteyi döner (bkz. [bölüm 5](#5-bellek-boyutlandırma)).
 - **Bellek ve bağımlılık:** Bellek çağıran taraftan gelir. Boost, C++, libc ve `malloc` kullanılmaz.
 - **grundman profili:** `size_distribution.txt` ilk satırda 22 satır bildirir ama 23 veri satırı içerir. Orijinal yalnızca ilk 22 satırı okur. `gen_profiles.py` de aynısını yapar ve son satırı (`4294967296 5`) uyarıyla atlar.
 
@@ -327,7 +355,7 @@ Kararlı aşamada canlı veri `volume × fill_ratio` hedefinden sapabilir. Örne
 - Boyut dağılımı dosya **sayısına** göre tutulur. Bu yüzden canlı byte, canlı dosya sayısını izler.
 - Dosya sayısı `T − K` işlem boyunca sapmasız bir rastgele yürüyüştür. Canlı/hedef oranının standart sapması yaklaşık `sqrt(T − K) / N*` olur. Agrawal için bu değer 256 MB'ta ~%20, 1 GB'ta ~%10, 2 GB'ta ~%6–7'dir.
 - Bizim `stable_one` aynı yazı-turayı kullanır. 30 tohumla yapılan ölçümlerde bizim kod ile orijinalin karar kurallarının modeli aynı dağılımı verdi (2 GB: ortalama oran 0,98, sapma 0,06–0,075). 2 GB'ta gözlenen 0,9075 oranı yaklaşık −1,5 sigma'lık normal bir sapmadır.
-- Tek ek farkımız, kayıt havuzu dolunca oluşturmanın silmeye dönmesidir. Bu yalnızca yukarı yönde bir sınırdır.
+- Ek farklarımız: kayıt havuzu dolunca oluşturmanın silmeye dönmesi (yalnızca yukarı yönde bir sınır) ve canlı dosya sayısı 0'a inince yazı-tura silme dese de oluşturma yapılması (yalnızca aşağı yönde, 0'da bir sınır; orijinal burada çıkar).
 
 Aynı not kodda, `fs_aging.c` içindeki `stable_one()` fonksiyonunun üstünde de yer alır.
 
@@ -353,7 +381,7 @@ typedef struct {
 | Kod | `create_file` sonrası çekirdek | `delete_file` / `make_dir` sonrası çekirdek |
 |---|---|---|
 | `FS_AGING_PLAT_OK` | Dosyayı kaydeder, `size_bytes` kadar canlı veri sayar. | Devam eder. |
-| `FS_AGING_PLAT_NO_SPACE` | Dosya **oluşmamış** kabul edilir. Aynı işlemde bir dosya silinir ve aging devam eder. Silinecek dosya yoksa `FS_AGING_ERR_PLATFORM`. | `FS_AGING_ERR_PLATFORM`, aging durur. |
+| `FS_AGING_PLAT_NO_SPACE` | Dosya **oluşmamış** kabul edilir. Aynı işlemde bir dosya silinir ve aging devam eder. Silinecek dosya yoksa silme yapılmaz ve aging devam eder (FILL'de volume'e sığan bir boyut boş volume'de `NO_SPACE` aldıysa aynı işlemde en küçük boyutla bir `create_file` daha yapılır); yalnızca oluşturma yapılamıyor ve silinecek dosya yoksa (gerçek çıkmaz, bkz. durum kodları) `FS_AGING_ERR_PLATFORM`. | `FS_AGING_ERR_PLATFORM`, aging durur. |
 | `FS_AGING_PLAT_ERROR` | `FS_AGING_ERR_PLATFORM`, aging durur. | `FS_AGING_ERR_PLATFORM`, aging durur. |
 
 `NO_SPACE` yalnızca `create_file` için anlamlıdır. `delete_file` ve `make_dir`, `OK` dışındaki **her** değerde aging'i durdurur.
@@ -523,7 +551,9 @@ make -C TEST clean      # TEST/build/ temizlenir
   - Çıkış kodu 0 ancak sahte platform tutarlıysa, durum `DONE_*` ise ve verilen kalite koşulları sağlanıyorsa olur.
 
   `make test` her profili `-q --max-err 0.15` ile çalıştırır. Agrawal 256 MB için `--expect-ops 155682 --max-err 0.0025` kullanılır; böylece aşağıdaki referans sonuç otomatik doğrulanır.
-  - **Not:** `make test`'teki volume/seed seçimleri tohuma bağlıdır. Örneğin `douceur` 64 MB seed 42'de geçer, ama seed 3'te `ERR_PLATFORM` (STABLE'da canlı dosya 0'a iner), seed 4'te `ERR_POOL_FULL` ile biter (bkz. [bölüm 3](#durum-kodları-fs_aging_status_t) ve [bölüm 5](#5-bellek-boyutlandırma)). İşlem dizisini değiştiren zararsız bir çekirdek değişikliği de bu nedenle `douceur` kapısını kırabilir. Kalıcı çözüm (çekirdek davranışı ve havuz payı) kullanıcı kararı bekliyor.
+  - `host_test` kayıt havuzunu doğrudan `fs_aging_estimate_files()` ile boyutlandırır (ek pay yok).
+  - **Not:** `ERR_PLATFORM` (canlı dosya yokken silme) hata biçimi artık oluşmaz; `ERR_POOL_FULL` (havuz tahmini yetmez) [bölüm 5](#5-bellek-boyutlandırma)'teki doğrulamada hiç oluşmadı: `douceur` 64 MB seed 1–20'nin hepsi `DONE_CONVERGED` ve tutarsızlık 0 ile biter (eskiden 12 seed `ERR_PLATFORM`, 3 seed `ERR_POOL_FULL`). Tohuma bağlı kalan tek şey kalite kapısıdır: küçük volume'de STABLE'daki rastgele yürüyüş canlı dosya sayısını düşürebilir ve yaş hatası 0,15'i aşabilir (`douceur` 64 MB'ta yeni havuzla (2432) seed 1, 2, 3, 5, 9, 12, 17, 18: yaş hatası 0,15–0,96; 12 seed geçer). Bu yüzden `make test` seed 42'yi sabit tutar; işlem dizisini ya da havuz boyutunu değiştiren bir değişiklik `douceur` kapısını yine kırabilir.
+  - Havuz boyutu STABLE'da havuz dolduğunda işlem dizisini etkiler (bkz. [bölüm 5](#stableda-havuzun-dolması)). Havuz tahmini değiştiğinde seed 42'de `douceur` 64 MB ve `wang_os` 256 MB'ın `SUMMARY` satırları bu yüzden değişti (işlem sayısı aynı; havuzlardan en az biri STABLE'da doluyordu); diğer 6 satır ve Agrawal referansı bit bit aynıdır. Eski havuz boyutlandırmasıyla (eski tahmin + %25) yeni çekirdek 8 satırın 8'ini de bit bit aynı üretir.
 - **`edge_tests`** — Hata ve sınır durumları:
   - küçük havuzda `FS_AGING_ERR_POOL_FULL`
   - platformun erken `NO_SPACE` döndüğü durumda hatasız devam
@@ -533,6 +563,10 @@ make -C TEST clean      # TEST/build/ temizlenir
   - determinizm (aynı seed → aynı sonuç, farklı seed → farklı sonuç)
   - adım bağımsızlığı (`max_ops` 1 / 7 / 1000 aynı sonuç): tam yakınsama, `confidence` 0.9 ile `DONE_TOLERANCE` ve erken `NO_SPACE` (oluşturma yerine silme) senaryolarında
   - yaş kovası yerleştirme: adım başına sınırlı tarama ve çağrı; STABLE'a geçişte her canlı kaydın tam bir kez sayılması (`sum(count_age) == live_files`, her koşuda kontrol edilir)
+  - STABLE'da canlı dosya 0'a inince silme yerine oluşturma (`agrawal` 16 MB seed 42 artık `DONE_*` ile ve tutarlı biter)
+  - FILL'de volume boşken `NO_SPACE`: ilk örneklenen boyutlar sığmasa da çalışma silmeden devam edip biter
+  - gerçek çıkmaz: hiçbir boyutu volume'e sığmayan profil (tahmin `0`), boş volume'de bile `NO_SPACE` dönen platform, STABLE'da sığan boyut kalmayan profil ve STABLE'da canlı dosya yokken `NO_SPACE` alan oluşturma takılmadan `FS_AGING_ERR_PLATFORM` ile biter; her durumda log mesajı da kontrol edilir. Volume'e sığan boyut boş volume'de `NO_SPACE` alınca en küçük boyutun aynı işlemde denendiği (çıkmaz ilk işlemde; kapasite 4 KB'ye yetiyorsa çalışma sürer) ayrıca sınanır
+  - havuz = `fs_aging_estimate_files()` (ek pay yok): 8 profil × seed 1–30 × {16, 64, 256} MB, yalnızca FILL, hiç `FS_AGING_ERR_POOL_FULL` yok; ayrıca önceki taslakta `POOL_FULL` veren `pramod` 16 MB 0.95 seed 849, `wang_os` 4 MB 0.8 seed 152, 8 MB 0.95 seed 1892 ve 16 MB 0.3 seed 1892 ile yalnızca volume boşken sığan boyutlu iki sentetik profil; STABLE'da havuzun dolmasının zararsız olduğu (silmeye dönüş) ayrıca sınanır
 
 Referans sonuç (Agrawal, 256 MB, `fill_ratio` 0.8, seed 42, `max_ops` 1000, `confidence` 0): `FS_AGING_DONE_CONVERGED`; 155682 işlem (78765 oluşturma, 76917 silme), 1848 canlı dosya, ~200 MB canlı veri, yaş hatası 0,0023, sahte platform tutarsızlığı 0.
 

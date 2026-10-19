@@ -58,16 +58,21 @@ $(EDGE_TEST): src/edge_tests.c $(CORE_SRC) $(CORE_HDR) | build
 $(EDGE_PATH): src/edge_tests.c $(CORE_SRC) $(CORE_HDR) | build
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFS_AGING_PATH_MAX=64u -o $@ $(CORE_SRC) src/edge_tests.c
 
-# Profil kosulari: seed 42, confidence 0 (tam yakinsama). Volume'ler her
-# profilin onerilen havuzla (tahmin + %25) DONE_* durumuna ulastigi ve
-# toplam surenin kisa kaldigi degerlerdir.
+# Profil kosulari: seed 42, confidence 0 (tam yakinsama). host_test havuzu
+# dogrudan fs_aging_estimate_files() ile boyutlandirir (ek pay yok).
+# Volume'ler toplam surenin kisa kaldigi degerlerdir.
 # Kalite kapisi: agrawal 256 MB onceki dogrulanmis sonucla ayni olmalidir
 # (islem=155682, yas_hatasi=0.0023); diger profillerde yas/boyut/dizin
 # hatasi (toplam varyasyon mesafesi) MAX_ERR'i asmamalidir.
-# Not: bu volume/seed secimleri tohuma baglidir. Ozellikle douceur 64 MB
-# baska seed'lerle ERR_PLATFORM (STABLE'da canli dosya 0'a iner) ya da
-# ERR_POOL_FULL (havuz tahmini + %25 yetmez) ile bitebilir; core bu iki
-# konuda kullanici karari bekliyor (README bolum 3 ve 5).
+# Not: ERR_PLATFORM (canli dosya yokken silme) artik olusmaz; ERR_POOL_FULL
+# (havuz tahmini yetmez) README bolum 5'teki dogrulamada hic olusmadi.
+# douceur 64 MB seed 1-20'nin hepsi DONE_CONVERGED ve tutarsizlik 0 ile
+# biter. Tohuma bagli kalan tek sey kalite kapisidir: kucuk volume'de STABLE'daki rastgele yuruyus canli
+# dosya sayisini dusurebilir ve yas hatasi MAX_ERR'i asabilir (douceur
+# 64 MB'ta seed 1, 2, 3, 5, 9, 12, 17, 18: yas hatasi 0.15-0.96). Bu
+# yuzden seed 42 sabit tutulur; islem dizisini degistiren bir core
+# degisikligi ya da havuz boyutu degisikligi (STABLE'da havuz dolunca
+# olusturma silmeye doner) douceur kapisini yine kirabilir.
 AGRAWAL_OPS := 155682
 AGRAWAL_ERR := 0.0025
 MAX_ERR     := 0.15

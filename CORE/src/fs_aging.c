@@ -18,6 +18,21 @@
  *    seferde degil, islem basina FS_AGING_REBIN_CHUNK kayit taranarak
  *    yerlestirilir; tek bir fs_aging_step() suresi havuz boyutundan
  *    bagimsiz kalir. Bu ara islemler tick ve rastgele sayi tuketmez.
+ *  - Silinecek dosya yokken silme gerekirse calisma durmaz: STABLE'da
+ *    canli dosya yokken yazi-tura silme dese de olusturma yapilir; FILL'de
+ *    bos volume'de NO_SPACE alan olusturmanin yerine silme yapilmaz:
+ *    volume'den buyuk boyutta islem tuketilir ve sonraki islem yeni bir
+ *    boyut ceker, volume'e sigan boyutta ayni islemde en kucuk boyut
+ *    denenir. Orijinal bu durumda "Cannot delete a single file of any
+ *    size!" basip cikar (geriatrix.cpp:759-762). Yalnizca olusturma
+ *    yapilamiyor ve silinecek dosya da yoksa (ilerleme imkansiz)
+ *    FS_AGING_ERR_PLATFORM ile durulur. Daha once hata vermeyen yollarda
+ *    rastgele sayi tuketimi degismez.
+ *  - fs_aging_estimate_files() ortalama boyuttan kaba bir tahmin degil,
+ *    FILL icin dogrudan kullanilabilir guvenli bir havuz kapasitesi doner
+ *    (FILL boyunca her zaman sigan boyutlar, yenileme icin alt kuyruk
+ *    olasilik siniri, kesin ust sinir; ayrinti fonksiyonun ustunde).
+ *    Orijinalde boyle bir havuz yoktur.
  *
  * Bu dosya libc kullanmaz.
  */
@@ -424,8 +439,9 @@ static void do_delete(fs_aging_ctx_t *c)
     uint32_t idx = pick_victim(c);
 
     if (idx == NONE_U32) {
-        fail(c, FS_AGING_ERR_PLATFORM,
-             "fs_aging: volume dolu ve silinecek dosya yok");
+        /* Savunma amacli: cagiranlar yalnizca canli dosya varken siler,
+         * pick_victim() de o durumda her zaman bir kayit bulur. */
+        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: silinecek dosya yok");
         return;
     }
     f = &c->pool[idx];
@@ -582,9 +598,69 @@ static void check_workload(fs_aging_ctx_t *c)
     }
 }
 
+/* Agirligi pozitif en kucuk boyutun satiri (profilde en az bir satirin
+ * agirligi pozitiftir, init dogrular). */
+static uint32_t min_size_bin(const fs_aging_ctx_t *c)
+{
+    uint32_t best = 0u;
+    uint32_t found = 0u;
+    uint32_t i;
+
+    for (i = 0u; i < c->profile->size_count; i++) {
+        if ((c->ideal_size[i] > 0.0) &&
+            ((found == 0u) || (c->profile->sizes[i].size_bytes <
+                               c->profile->sizes[best].size_bytes))) {
+            best = i;
+            found = 1u;
+        }
+    }
+    return best;
+}
+
+/* FILL'de bos volume'de (canli dosya yok) olusturma NO_SPACE aldi;
+ * silinecek dosya yoktur. Karar ayni islemde ve kesin verilir:
+ *  - Agirligi pozitif en kucuk boyut bile volume'den buyukse hicbir
+ *    olusturma basarili olamaz: gercek cikmaz, FS_AGING_ERR_PLATFORM.
+ *  - NO_SPACE alan boyut volume'den buyukse (hic sigmaz) islem tuketilir;
+ *    sonraki islem yeni bir boyut ceker. Her islemde volume'e sigan bir
+ *    boyut pozitif olasilikla cekilir ve asagidaki dallardan biri o
+ *    islemde kesin karar verir.
+ *  - Boyut volume'e sigdigi halde platform bos volume'de NO_SPACE dondu
+ *    (gercek kapasite volume_bytes'tan kucuk): NO_SPACE alan boyut zaten en
+ *    kucuk boyutsa gercek cikmazdir; degilse ayni islemde en kucuk boyut
+ *    denenir (ikinci create_file). O da NO_SPACE alirsa gercek cikmazdir.
+ * Bu yol eskiden her zaman FS_AGING_ERR_PLATFORM ile bitiyordu; daha once
+ * hata vermeyen yollarin rastgele sayi tuketimi degismez. */
+static void fill_empty_no_space(fs_aging_ctx_t *c, uint32_t size_bin)
+{
+    uint32_t min_bin = min_size_bin(c);
+    uint64_t min_size = c->profile->sizes[min_bin].size_bytes;
+    uint64_t size = c->profile->sizes[size_bin].size_bytes;
+    int dead = 0;
+
+    if (min_size > c->config.volume_bytes) {
+        dead = 1;
+    } else if (size > c->config.volume_bytes) {
+        /* Hic sigmayan boyut: islem tuketildi (orijinalden bilincli fark,
+         * dosya basinda) */
+    } else if (size <= min_size) {
+        dead = 1;
+    } else if (do_create(c, min_bin) == CR_NO_SPACE) {
+        dead = 1;
+    } else {
+        /* CR_OK: en kucuk boyut olusturuldu. CR_FAIL: durum zaten hata.
+         * CR_POOL_FULL olamaz (canli dosya 0, kapasite en az 1). */
+    }
+    if (dead != 0) {
+        fail(c, FS_AGING_ERR_PLATFORM,
+             "fs_aging: bos volume'e hicbir profil boyutu sigmiyor");
+    }
+}
+
 static void fill_one(fs_aging_ctx_t *c)
 {
     create_result_t r;
+    uint32_t size_bin;
 
     if (c->rebin_active != 0u) {
         rebin_one(c);
@@ -598,9 +674,14 @@ static void fill_one(fs_aging_ctx_t *c)
     }
 
     c->tick++;
-    r = do_create(c, pick_size_sampled(c));
+    size_bin = pick_size_sampled(c);
+    r = do_create(c, size_bin);
     if (r == CR_NO_SPACE) {
-        do_delete(c);
+        if (c->live_files != 0u) {
+            do_delete(c);
+        } else {
+            fill_empty_no_space(c, size_bin);
+        }
     } else if (r == CR_POOL_FULL) {
         fail(c, FS_AGING_ERR_POOL_FULL,
              "fs_aging: kayit havuzu doldurma icin yetersiz");
@@ -620,15 +701,25 @@ static void fill_one(fs_aging_ctx_t *c)
  * hedef etrafinda sapmasiz bir rastgele yuruyus yapar ve hedeften
  * sapabilir. Bu orijinal davranistir, bilerek ayni birakildi; sapmayi
  * bir bantla sinirlamak orijinalden sapma olur ve kullanici onayi ister.
- * Not: canli dosya sayisi 0'a inerse ve yazi-tura silme derse
- * do_delete() FS_AGING_ERR_PLATFORM ile durur. */
+ *
+ * Canli dosya yokken (sayi rastgele yuruyusle 0'a indiyse) yazi-tura
+ * silme dese de olusturma yapilir. Orijinal bu durumda "Cannot delete a
+ * single file of any size!" basip cikar (geriatrix.cpp:759-762); bu
+ * bilincli bir farktir. Yazi-tura her islemde yine cekilir, boylece daha
+ * once hata vermeyen tum yollarda rastgele sayi tuketimi ayni kalir.
+ * Olusturma da yapilamiyorsa (volume'e sigan profil boyutu yok, NO_SPACE
+ * ya da havuz dolu) ve silinecek dosya yoksa ilerleme imkansizdir:
+ * FS_AGING_ERR_PLATFORM ile hemen durulur (sonsuz donguye girilmez). */
 static void stable_one(fs_aging_ctx_t *c)
 {
     int need_delete = 1;
+    uint64_t coin;
+    uint32_t size_bin = NONE_U32;
 
     c->tick++;
-    if ((rng_next(c) >> 63) != 0u) {
-        uint32_t size_bin = pick_size_stable(c);
+    coin = rng_next(c) >> 63;
+    if ((coin != 0u) || (c->live_files == 0u)) {
+        size_bin = pick_size_stable(c);
         if (size_bin != NONE_U32) {
             create_result_t r = do_create(c, size_bin);
             if ((r == CR_OK) || (r == CR_FAIL)) {
@@ -638,6 +729,12 @@ static void stable_one(fs_aging_ctx_t *c)
         }
     }
     if (need_delete != 0) {
+        if (c->live_files == 0u) {
+            fail(c, FS_AGING_ERR_PLATFORM, (size_bin == NONE_U32)
+                 ? "fs_aging: volume'e sigan profil boyutu yok ve silinecek dosya yok"
+                 : "fs_aging: olusturma NO_SPACE aldi ve silinecek dosya yok");
+            return;
+        }
         do_delete(c);
     }
     if (c->status != FS_AGING_RUNNING) {
@@ -746,6 +843,19 @@ static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
     return best;
 }
 
+/* Doldurma hedefi: volume * fill_ratio, uint64_t'ye. volume 2^64'e yakin
+ * ve fill_ratio 1 iken carpim 2^64'e yuvarlanabilir; bu degerin uint64_t'ye
+ * donusumu tanimsiz davranistir. Bu durumda temsil edilebilen en buyuk
+ * double'a (2^64 - 2048) kirpilir. Diger tum girdilerde sonuc degismez. */
+static uint64_t fill_target(uint64_t volume_bytes, fs_aging_float_t fill_ratio)
+{
+    fs_aging_float_t x = (fs_aging_float_t)volume_bytes * fill_ratio;
+    if (!(x < 18446744073709551616.0)) {
+        x = 18446744073709549568.0;
+    }
+    return (uint64_t)x;
+}
+
 /* ================================================================== */
 /* API                                                                 */
 /* ================================================================== */
@@ -828,8 +938,7 @@ fs_aging_status_t fs_aging_init(fs_aging_ctx_t             *ctx,
         ctx->ideal_dir[i] = profile->dirs[i].weight / total;
     }
 
-    ctx->target_live_bytes = (uint64_t)((fs_aging_float_t)config->volume_bytes *
-                                        config->fill_ratio);
+    ctx->target_live_bytes = fill_target(config->volume_bytes, config->fill_ratio);
     ctx->workload_limit_bytes = config->volume_bytes *
                                 (uint64_t)config->overwrite_runs;
 
@@ -954,33 +1063,166 @@ int fs_aging_get_bin(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist,
     return 0;
 }
 
+/* Karekok, libm'siz: y >= sqrt(x) baslangicindan Newton adimlari monoton
+ * azalir; azalma durunca (ya da en fazla 2048 adim sonunda) durulur.
+ * NaN ve x <= 0 icin 0, sonsuz icin sonsuz doner. */
+static fs_aging_float_t f_sqrt(fs_aging_float_t x)
+{
+    fs_aging_float_t y;
+    uint32_t i;
+
+    if (!(x > 0.0)) {
+        return 0.0;
+    }
+    if ((x - x) != 0.0) {
+        return x;
+    }
+    y = (x > 1.0) ? x : 1.0;
+    for (i = 0u; i < 2048u; i++) {
+        fs_aging_float_t next = 0.5 * (y + (x / y));
+        if (!(next < y)) {
+            break;
+        }
+        y = next;
+    }
+    return y;
+}
+
+/* fs_aging_estimate_files(): ln(1/delta), delta = 1e-6 (yenileme modelinde
+ * havuzun yetmeme olasiligi ust siniri) ve sabit pay */
+#define EST_LN_INV_DELTA  13.815510557964274
+#define EST_MARGIN        16.0
+
+/* FILL boyunca ulasilan en yuksek canli dosya sayisi icin guvenli ust
+ * tahmin. T = volume * fill_ratio doldurma hedefidir.
+ *  - FILL'de olusturma oncesi canli veri T'nin altindadir; bu yuzden
+ *    size <= volume - T olan boyutlar FILL boyunca her zaman sigar. Daha
+ *    buyuk boyutlar (volume - T < size) ya hic sigmaz ya da yalnizca volume
+ *    henuz bosken sigar; sigmadiklarinda NO_SPACE alip silme yaptirirlar.
+ *    Ikisi de dosya sayisini yalnizca azaltir. Bu yuzden yenileme tahmini
+ *    yalnizca agirligi pozitif ve size <= volume - T olan boyutlarla
+ *    yapilir; agirliklar bunlar uzerinde yeniden normalize edilir.
+ *  - Yenileme: T'ye ulasmak icin gereken dosya sayisi N, ilk n dosyanin
+ *    toplami S_n >= T olan en kucuk n'dir; N > n ancak S_n < T ise olur.
+ *    Negatif olmayan bagimsiz boyutlar icin alt kuyruk siniri (Bernstein
+ *    tipi, normal yaklasim degil): P(S_n <= n*mu - t) <=
+ *    exp(-t^2 / (2 * n * m2)); mu ortalama, m2 = E[size^2]. Bu olasiligi
+ *    delta = exp(-L) yapan en kucuk n, n*mu - a*sqrt(n) = T denkleminin
+ *    cozumudur (a = sqrt(2 * L * m2)):
+ *        sqrt(n) = (a + sqrt(a^2 + 4 * mu * T)) / (2 * mu)
+ *    L = EST_LN_INV_DELTA (delta = 1e-6). Sonuca sabit pay eklenir.
+ *    (Onceki T/mu + k*sqrt(T*sigma^2/mu^3) dogrusal yaklasimi agir kuyrukta
+ *    kucuk T'de yetmiyordu: or. wang_os 16 MB 0.3 seed 1892 gereken 311,
+ *    tahmin 301.)
+ *  - Agir kuyruklu dagilimlarda m2 cok buyur. Boyutlar bir c esiginde
+ *    kirpilirsa (min(size, c)) toplam yalnizca azalir, yani gereken dosya
+ *    sayisi ancak artar; her c gecerli bir ust tahmin verir. Bu boyutlarin
+ *    her biri c olarak denenir ve en kucuk sonuc alinir.
+ *  - Kesin ust sinir: olusturma oncesi canli veri en fazla T - 1 byte'tir
+ *    ve her dosya en az s_min (agirligi pozitif, volume'e sigan en kucuk
+ *    pozitif boyut) byte'tir; dosya sayisi floor((T - 1) / s_min) + 1'i
+ *    gecemez. 0 byte'lik boyut yoksa sonuc bu sinirla kirpilir. size <=
+ *    volume - T olan pozitif boyut yoksa (or. fill_ratio 1.0) yalnizca bu
+ *    sinir kullanilir; 0 byte'lik boyut da varsa sinir yoktur (0xFFFFFFFF).
+ * Profil 48 satirla sinirlidir; maliyet en fazla 48 x (48 + 2048) adimdir
+ * (2048: f_sqrt adim siniri, pratikte birkac on adim). */
 uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
                                  uint64_t volume_bytes,
                                  fs_aging_float_t fill_ratio)
 {
-    fs_aging_float_t total = 0.0;
-    fs_aging_float_t mean  = 0.0;
-    fs_aging_float_t files;
+    uint64_t t_bytes;
+    uint64_t room;
+    uint64_t min_pos = UINT64_MAX;
+    fs_aging_float_t target;
+    fs_aging_float_t best = -1.0;
+    fs_aging_float_t hard = -1.0;
+    uint32_t fits = 0u;
+    uint32_t zero_fits = 0u;
     uint32_t i;
+    uint32_t j;
 
     if ((profile == NULL) || (profile->sizes == NULL) ||
-        (profile->size_count == 0u)) {
+        (profile->size_count == 0u) || (profile->size_count > FS_AGING_MAX_BINS) ||
+        !(fill_ratio > 0.0) || (fill_ratio > 1.0)) {
         return 0u;
     }
+    t_bytes = fill_target(volume_bytes, fill_ratio);
+    if (t_bytes > volume_bytes) {
+        t_bytes = volume_bytes;
+    }
+    room   = volume_bytes - t_bytes;
+    target = (fs_aging_float_t)t_bytes;
+
     for (i = 0u; i < profile->size_count; i++) {
-        total += profile->sizes[i].weight;
-        mean  += profile->sizes[i].weight *
-                 (fs_aging_float_t)profile->sizes[i].size_bytes;
+        uint64_t s = profile->sizes[i].size_bytes;
+        if (!(profile->sizes[i].weight > 0.0) || (s > volume_bytes)) {
+            continue;
+        }
+        fits++;
+        if (s == 0u) {
+            zero_fits++;
+        } else if (s < min_pos) {
+            min_pos = s;
+        } else {
+            /* daha kucugu zaten bulundu */
+        }
     }
-    if ((total <= 0.0) || (mean <= 0.0)) {
-        return 0u;
+    if (fits == 0u) {
+        return 0u;                 /* hicbir boyut volume'e sigmiyor */
     }
-    mean /= total;
-    files = ((fs_aging_float_t)volume_bytes * fill_ratio) / mean + 1.0;
-    if (files >= 4294967295.0) {
+    if ((zero_fits == 0u) && (min_pos != UINT64_MAX)) {
+        hard = (t_bytes == 0u) ? 1.0
+               : ((fs_aging_float_t)((t_bytes - 1u) / min_pos) + 1.0);
+    }
+
+    for (j = 0u; j < profile->size_count; j++) {
+        uint64_t cut = profile->sizes[j].size_bytes;
+        fs_aging_float_t w_sum = 0.0;
+        fs_aging_float_t m1 = 0.0;
+        fs_aging_float_t m2 = 0.0;
+        fs_aging_float_t a;
+        fs_aging_float_t r;
+        fs_aging_float_t n;
+
+        if (!(profile->sizes[j].weight > 0.0) || (cut > room) || (cut == 0u)) {
+            continue;
+        }
+        for (i = 0u; i < profile->size_count; i++) {
+            fs_aging_float_t w = profile->sizes[i].weight;
+            uint64_t s = profile->sizes[i].size_bytes;
+            fs_aging_float_t x;
+            if (!(w > 0.0) || (s > room)) {
+                continue;
+            }
+            x = (fs_aging_float_t)((s < cut) ? s : cut);
+            w_sum += w;
+            m1    += w * x;
+            m2    += w * x * x;
+        }
+        m1 /= w_sum;               /* cut > 0 ve agirligi pozitif: m1 > 0 */
+        m2 /= w_sum;
+        a = f_sqrt(2.0 * EST_LN_INV_DELTA * m2);
+        r = (a + f_sqrt((a * a) + (4.0 * m1 * target))) / (2.0 * m1);
+        n = r * r;
+        if ((best < 0.0) || (n < best)) {
+            best = n;
+        }
+    }
+
+    if (best >= 0.0) {
+        best += EST_MARGIN + 1.0;  /* +1: tamsayiya yukari yuvarlama */
+        if ((hard >= 0.0) && (hard < best)) {
+            best = hard;
+        }
+    } else if (hard >= 0.0) {
+        best = hard;               /* her zaman sigan pozitif boyut yok */
+    } else {
+        return 0xFFFFFFFFu;        /* sinirsiz: 0 byte'lik boyutlar sigiyor */
+    }
+    if (!(best < 4294967295.0)) {
         return 0xFFFFFFFFu;
     }
-    return (uint32_t)files;
+    return (uint32_t)best;
 }
 
 const char *fs_aging_status_str(fs_aging_status_t status)

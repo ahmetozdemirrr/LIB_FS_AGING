@@ -8,7 +8,8 @@
  *   1. Port katmani fs_aging_platform_t'yi doldurur.
  *   2. Cagiran taraf dosya kayit havuzunu verir:
  *          static fs_aging_file_t pool[50000];
- *      Gerekli kapasite icin fs_aging_estimate_files() kullanilabilir.
+ *      Gerekli kapasite fs_aging_estimate_files() ile bulunur (dogrudan
+ *      kullanilabilir, ek pay gerekmez).
  *   3. fs_aging_init() bir kez cagrilir.
  *   4. fs_aging_step() FS_AGING_RUNNING disinda bir deger donene kadar
  *      tekrar tekrar cagrilir (ARINC653'te periyodik process'ten).
@@ -79,13 +80,16 @@ typedef enum {
     FS_AGING_ERR_PARAM,            /* gecersiz profil / config / platform    */
     FS_AGING_ERR_POOL_FULL,        /* FILL asamasinda kayit havuzu yetmedi   */
     FS_AGING_ERR_PATH_TOO_LONG,    /* profil FS_AGING_PATH_MAX'i asiyor      */
-    FS_AGING_ERR_PLATFORM          /* platform callback'i hata dondu         */
+    FS_AGING_ERR_PLATFORM          /* platform callback'i hata dondu ya da
+                                      olusturma yapilamadi ve silinecek
+                                      dosya yok (ilerleme imkansiz)          */
 } fs_aging_status_t;
 
 /* Platform callback'lerinin donus degerleri. */
 typedef enum {
     FS_AGING_PLAT_OK = 0,
-    FS_AGING_PLAT_NO_SPACE,        /* volume dolu: core bunun yerine silme yapar */
+    FS_AGING_PLAT_NO_SPACE,        /* volume dolu: core bunun yerine silme yapar
+                                      (canli dosya yoksa silme yapilmaz)        */
     FS_AGING_PLAT_ERROR            /* diger tum hatalar: aging durur             */
 } fs_aging_plat_result_t;
 
@@ -157,7 +161,13 @@ typedef struct {
     const char       *mount_point;    /* sonunda '/' olmadan, or. "/fs0"   (-m)
                                          aging boyunca gecerli kalmalidir      */
     uint64_t          volume_bytes;   /* dosya sistemi toplam boyutu       (-n) */
-    fs_aging_float_t  fill_ratio;     /* hedef doluluk, 0-1 arasi, or. 0.8 (-u) */
+    fs_aging_float_t  fill_ratio;     /* hedef doluluk, 0-1 arasi, or. 0.8 (-u)
+                                         FILL hedefe tam ulasana kadar surer;
+                                         hedef ulasilamazsa (or. 1.0'a yakin
+                                         oran, gercek kapasite volume'den
+                                         kucuk) olustur/sil dongusunde
+                                         kalabilir: overwrite_runs ya da
+                                         time_limit_s verin                    */
     uint32_t          seed;           /* rastgelelik tohumu                (-r) */
     uint32_t          overwrite_runs; /* toplam yuk = runs * volume_bytes  (-i)
                                          0 = sinirsiz                          */
@@ -293,8 +303,22 @@ int fs_aging_get_bin(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist,
                      uint32_t index,
                      fs_aging_float_t *ideal, fs_aging_float_t *actual);
 
-/* Profil ve volume icin FILL sonunda beklenen yaklasik dosya sayisi.
- * Havuzu bunun en az %25 fazlasi kadar boyutlandirmak onerilir. */
+/* FILL asamasi icin guvenli kayit havuzu kapasitesi. 0 ve 0xFFFFFFFF
+ * disindaki donen deger dogrudan fs_aging_init()'in pool_capacity'si
+ * olarak kullanilabilir; ek %25 pay gerekmez. Yenileme tahmini FILL
+ * boyunca her zaman sigan boyutlarla (size_bytes <= volume_bytes -
+ * volume_bytes * fill_ratio) ve normal yaklasim yerine negatif olmayan
+ * boyutlar icin bir alt kuyruk olasilik siniriyla (delta = 1e-6) yapilir,
+ * sonuc kesin bir ust sinirla kirpilir (ayrinti fs_aging.c). FILL'deki en
+ * yuksek canli dosya sayisini kapsar (ampirik dogrulama README bolum 5);
+ * STABLE'da havuzun dolmasi hata degildir (olusturma yerine silme).
+ * 0 doner (gecerli kapasite degil): profile NULL / bos, size_count >
+ * FS_AGING_MAX_BINS, fill_ratio (0, 1] disinda ya da agirligi pozitif
+ * hicbir boyut volume'e sigmiyor (aging FILL'de FS_AGING_ERR_PLATFORM ile
+ * biter).
+ * 0xFFFFFFFF doner (gecerli kapasite degil, init reddeder): sonuc 32 bite
+ * sigmiyor ya da guvenli sinir yok (volume'e sigan 0 byte'lik boyut var ve
+ * FILL boyunca her zaman sigan pozitif boyut yok, or. fill_ratio 1.0). */
 uint32_t fs_aging_estimate_files(const fs_aging_profile_t *profile,
                                  uint64_t volume_bytes,
                                  fs_aging_float_t fill_ratio);

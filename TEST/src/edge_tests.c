@@ -9,6 +9,7 @@
  * olarak:
  *   - gercek kapasiteyi config volume'unden kucuk tutabilir (erken NO_SPACE),
  *   - N. create / delete / make_dir cagrisinda ERROR donebilir,
+ *   - hic dosya yokken donen NO_SPACE'leri ve en yuksek dosya sayisini sayar,
  *   - tum cagri dizisinin (tur, yol, boyut, sonuc) ozetini tutar.
  *
  * FS_AGING_PATH_MAX varsayilan (256) ile derlenince tum testler kosar.
@@ -30,6 +31,11 @@ static const int g_full_suite = ((FS_AGING_PATH_MAX) >= 256u) ? 1 : 0;
 
 /* Sonsuz donguye karsi adim siniri */
 #define MAX_STEPS 50000000u
+
+/* Gercek cikmaz log mesajlari (fs_aging.c) */
+#define MSG_FILL_DEAD      "fs_aging: bos volume'e hicbir profil boyutu sigmiyor"
+#define MSG_STABLE_NOFIT   "fs_aging: volume'e sigan profil boyutu yok ve silinecek dosya yok"
+#define MSG_STABLE_NOSPACE "fs_aging: olusturma NO_SPACE aldi ve silinecek dosya yok"
 
 /* ---------------- Hash kumesi (host_test.c ile ayni) ----------------- */
 
@@ -134,11 +140,17 @@ typedef struct {
     uint64_t    n_delete;
     uint64_t    n_mkdir;
     uint64_t    no_space;
+    uint64_t    no_space_empty;    /* hic dosya yokken donen NO_SPACE     */
+    uint32_t    max_files;         /* ayni anda en fazla dosya sayisi     */
     uint64_t    call_hash;         /* cagri dizisinin FNV-1a ozeti        */
 
     uint64_t    fail_create_at;    /* N. cagrida ERROR, 0 = hic           */
     uint64_t    fail_delete_at;
     uint64_t    fail_mkdir_at;
+    uint64_t    nospace_from;      /* N. create'ten itibaren NO_SPACE, 0 = hic */
+
+    char        log_prev[128];     /* sondan bir onceki log mesaji        */
+    char        log_last[128];     /* son log mesaji                      */
 } fake_fs_t;
 
 static uint64_t fnv_bytes(uint64_t h, const void *data, size_t n)
@@ -211,8 +223,12 @@ static fs_aging_plat_result_t create_impl(fake_fs_t *fs, const char *path,
         fs->errors++;
         return FS_AGING_PLAT_ERROR;
     }
-    if ((fs->used + size) > fs->capacity) {
+    if (((fs->used + size) > fs->capacity) ||
+        ((fs->nospace_from != 0u) && (fs->n_create >= fs->nospace_from))) {
         fs->no_space++;
+        if (fs->files.count == 0u) {
+            fs->no_space_empty++;
+        }
         return FS_AGING_PLAT_NO_SPACE;
     }
     if (hset_insert(&fs->files, key, size) != 0) {
@@ -221,6 +237,9 @@ static fs_aging_plat_result_t create_impl(fake_fs_t *fs, const char *path,
         return FS_AGING_PLAT_ERROR;
     }
     fs->used += size;
+    if (fs->files.count > fs->max_files) {
+        fs->max_files = fs->files.count;
+    }
     return FS_AGING_PLAT_OK;
 }
 
@@ -296,6 +315,17 @@ static fs_aging_plat_result_t fake_mkdir(void *u, const char *path)
     r = mkdir_impl(fs, path);
     record_call(fs, 'M', path, 0u, r);
     return r;
+}
+
+/* Log: core'un son iki mesaji saklanir (mesaj yalnizca cagri suresince
+ * gecerlidir, kopyalanir). Bitiste son mesaj durum metnidir, bir
+ * oncekisi hatanin nedenidir. */
+static void fake_log(void *u, const char *msg)
+{
+    fake_fs_t *fs = u;
+    memcpy(fs->log_prev, fs->log_last, sizeof(fs->log_prev));
+    (void)strncpy(fs->log_last, msg, sizeof(fs->log_last) - 1u);
+    fs->log_last[sizeof(fs->log_last) - 1u] = '\0';
 }
 
 static uint64_t max_dirs(const fs_aging_profile_t *pr)
@@ -395,12 +425,14 @@ typedef struct {
     const fs_aging_profile_t *profile;
     fs_aging_config_t cfg;
     uint32_t max_ops;
-    uint32_t pool_cap;           /* 0: tahmin + %25                 */
+    uint32_t pool_cap;           /* 0: fs_aging_estimate_files()    */
     uint64_t fs_capacity;        /* 0: cfg.volume_bytes             */
     uint64_t fail_create_at;
     uint64_t fail_delete_at;
     uint64_t fail_mkdir_at;
+    uint64_t nospace_from;       /* N. create'ten itibaren NO_SPACE  */
     int      watch;              /* adim basina cagri izleme (max_ops=1) */
+    int      stop_at_stable;     /* STABLE'a gecilince dur (yalniz FILL) */
 } run_opts_t;
 
 typedef struct {
@@ -417,6 +449,11 @@ typedef struct {
     uint64_t n_delete;
     uint64_t n_mkdir;
     uint64_t no_space;
+    uint64_t no_space_empty;
+    uint32_t max_files;          /* sahte fs'te en fazla dosya       */
+    uint32_t pool_cap;           /* kullanilan havuz kapasitesi      */
+    uint64_t stable_empty_steps; /* STABLE'da canli dosya 0 olan adim */
+    uint64_t stable_pool_full;   /* STABLE'da havuz dolu olan adim   */
     int      fs_errors;
     uint64_t fs_used;
     uint32_t fs_files;
@@ -424,6 +461,7 @@ typedef struct {
     int      step_limit_hit;
     uint64_t calls_after_end;    /* bitmis ctx'e ek step'teki cagrilar */
     fs_aging_status_t status_after_end;
+    char     err_msg[128];       /* bitiste durum metninden onceki log */
 
     /* STABLE'a gecilen adimda sum(count_age) == live_files mi? */
     int      rebin_checked;
@@ -463,14 +501,15 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
     if (o->pool_cap != 0u) {
         cap64 = o->pool_cap;
     } else {
+        /* API'nin dondurdugu deger dogrudan havuz kapasitesi (ek pay yok) */
         cap64 = fs_aging_estimate_files(o->profile, o->cfg.volume_bytes,
                                         o->cfg.fill_ratio);
-        cap64 += cap64 / 4u;
     }
     if (cap64 == 0u) {
         cap64 = 1u;
     }
     cap = (uint32_t)cap64;
+    r->pool_cap = cap;
 
     memset(&fs, 0, sizeof(fs));
     fs.mount          = o->cfg.mount_point;
@@ -480,6 +519,7 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
     fs.fail_create_at = o->fail_create_at;
     fs.fail_delete_at = o->fail_delete_at;
     fs.fail_mkdir_at  = o->fail_mkdir_at;
+    fs.nospace_from   = o->nospace_from;
     pool = calloc(cap, sizeof(*pool));
     if ((pool == NULL) || (hset_init(&fs.files, cap) != 0) ||
         (hset_init(&fs.dirs, max_dirs(o->profile)) != 0)) {
@@ -491,7 +531,7 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
     plat.delete_file = fake_delete;
     plat.make_dir    = fake_mkdir;
     plat.now_ms      = NULL;      /* zaman sonuclari etkilemesin */
-    plat.log         = NULL;
+    plat.log         = fake_log;
     plat.user        = &fs;
 
     for (i = 0u; i < o->profile->dir_count; i++) {
@@ -502,7 +542,8 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
 
     r->init_status = fs_aging_init(&ctx, o->profile, &o->cfg, &plat, pool, cap);
     r->status = r->init_status;
-    while ((r->status == FS_AGING_RUNNING) && (r->steps < MAX_STEPS)) {
+    while ((r->status == FS_AGING_RUNNING) && (r->steps < MAX_STEPS) &&
+           !((o->stop_at_stable != 0) && (ctx.phase == FS_AGING_PHASE_STABLE))) {
         uint64_t c0 = fs.calls;
         uint64_t n0 = fs.no_space;
         uint64_t k0 = fs.n_create;
@@ -513,6 +554,16 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
 
         r->status = fs_aging_step(&ctx, o->max_ops);
         r->steps++;
+
+        /* max_ops=1 iken adim sonu durumu her islemden sonraki durumdur */
+        if (ctx.phase == FS_AGING_PHASE_STABLE) {
+            if (ctx.live_files == 0u) {
+                r->stable_empty_steps++;
+            }
+            if (ctx.live_files >= cap) {
+                r->stable_pool_full++;
+            }
+        }
 
         /* Yas kovasi yerlestirme her canli kaydi tam bir kez saymali.
          * STABLE'da bu esitlik korunur; gecis adiminda bir kez bakilir. */
@@ -555,11 +606,14 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
                     r->max_calls_work = dc;
                 }
                 if (dc == 2u) {
-                    /* tek kabul edilen ikili: NO_SPACE donen olusturma
-                     * ve yerine yapilan silme */
+                    /* kabul edilen ikililer: NO_SPACE donen olusturma ve
+                     * yerine yapilan silme; ya da FILL'de bos volume'de
+                     * NO_SPACE donen olusturma ve en kucuk boyut denemesi */
                     r->two_call_steps++;
-                    if (((fs.no_space - n0) != 1u) || ((fs.n_create - k0) != 1u) ||
-                        ((fs.n_delete - e0) != 1u)) {
+                    if (!((((fs.no_space - n0) == 1u) && ((fs.n_create - k0) == 1u) &&
+                           ((fs.n_delete - e0) == 1u)) ||
+                          ((ph0 == FS_AGING_PHASE_FILL) && ((fs.no_space - n0) >= 1u) &&
+                           ((fs.n_create - k0) == 2u) && (fs.n_delete == e0)))) {
                         r->step_violation = 1;
                     }
                 } else if (dc > 2u) {
@@ -570,10 +624,15 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
             }
         }
     }
-    r->step_limit_hit = (r->status == FS_AGING_RUNNING) ? 1 : 0;
+    r->step_limit_hit = ((r->status == FS_AGING_RUNNING) &&
+                         !((o->stop_at_stable != 0) &&
+                           (ctx.phase == FS_AGING_PHASE_STABLE))) ? 1 : 0;
 
-    /* Bitmis context'e ek step: durum ayni kalmali, cagri yapilmamali */
-    {
+    /* Bitmis context'e ek step: durum ayni kalmali, cagri yapilmamali.
+     * Yalniz FILL kosusunda ctx bitmedigi icin atlanir. */
+    if (o->stop_at_stable != 0) {
+        r->status_after_end = r->status;
+    } else {
         uint64_t c0 = fs.calls;
         r->status_after_end = fs_aging_step(&ctx, o->max_ops);
         r->calls_after_end  = fs.calls - c0;
@@ -593,9 +652,12 @@ static int run_aging(const run_opts_t *o, run_result_t *r)
     r->n_delete  = fs.n_delete;
     r->n_mkdir   = fs.n_mkdir;
     r->no_space  = fs.no_space;
+    r->no_space_empty = fs.no_space_empty;
+    r->max_files = fs.max_files;
     r->fs_errors = fs.errors;
     r->fs_used   = fs.used;
     r->fs_files  = fs.files.count;
+    memcpy(r->err_msg, fs.log_prev, sizeof(r->err_msg));
 
     hset_free(&fs.files);
     hset_free(&fs.dirs);
@@ -689,6 +751,57 @@ static const fs_aging_profile_t  flat_profile = {
 static const fs_aging_dir_bin_t  huge_depth_dirs[] = { { 0xFFFFFFFFu, 1.0, 0u } };
 static const fs_aging_profile_t  huge_depth_profile = {
     "huge_depth", tiny_ages, 2u, tiny_sizes, 1u, huge_depth_dirs, 1u
+};
+
+/* 16 MB volume'e hic sigmayan 64 MB'lik boyut + 4 KB: FILL'in ilk
+ * islemleri bos volume'de NO_SPACE alabilir (silinecek dosya yok) */
+static const fs_aging_size_bin_t bigmix_sizes[] = { { 4096u, 3.0 }, { 67108864u, 1.0 } };
+static const fs_aging_profile_t  bigmix_profile = {
+    "bigmix", tiny_ages, 2u, bigmix_sizes, 2u, tiny_dirs, 2u
+};
+
+/* 16 MB volume'e hicbir boyutu sigmayan profil: gercek cikmaz */
+static const fs_aging_size_bin_t nofit_sizes[] = { { 33554432u, 1.0 }, { 67108864u, 1.0 } };
+static const fs_aging_profile_t  nofit_profile = {
+    "nofit", tiny_ages, 2u, nofit_sizes, 2u, tiny_dirs, 2u
+};
+
+/* Tek boyut = volume (16 MB): FILL tek dosyayla biter; STABLE'da
+ * pick_size_stable() bu boyutu sigmaz sayar (live + size >= volume),
+ * dosya silinince olusturulacak boyut da kalmaz: STABLE cikmazi. Yas
+ * esikleri hedef islem sayisini (T = 1000 x FILL islemi) buyutur; boylece
+ * tam yakinsama cikmazdan once gelmez. */
+static const fs_aging_age_bin_t  whole_ages[]  = { { 1.0, 1.0 }, { 1000.0, 1.0 } };
+static const fs_aging_size_bin_t whole_sizes[] = { { 16777216u, 1.0 } };
+static const fs_aging_profile_t  whole_profile = {
+    "whole", whole_ages, 2u, whole_sizes, 1u, tiny_dirs, 2u
+};
+
+/* Tek boyut = volume'un yarisi (8 MB), fill 0.5: FILL tek dosyayla biter,
+ * STABLE'da dosya silinince 8 MB yine sigar; platform ikinci create'ten
+ * itibaren NO_SPACE donerse STABLE'da canli dosya yokken NO_SPACE cikmazi. */
+static const fs_aging_size_bin_t half_sizes[] = { { 8388608u, 1.0 } };
+static const fs_aging_profile_t  half_profile = {
+    "half", whole_ages, 2u, half_sizes, 1u, tiny_dirs, 2u
+};
+
+/* En kucuk boyutun agirligi cok kucuk: bos volume'de 8 KB NO_SPACE alinca
+ * ayni islemde 4 KB denenir (ornekleme ile 4 KB'yi beklemek gerekmez). */
+static const fs_aging_size_bin_t rare_sizes[] = { { 4096u, 0.0001 }, { 8192u, 1.0 } };
+static const fs_aging_profile_t  rare_profile = {
+    "rare", tiny_ages, 2u, rare_sizes, 2u, tiny_dirs, 2u
+};
+
+/* Havuz tahmini: volume'e sigan ama FILL'de yalnizca volume bosken
+ * sigan boyutlar (volume - hedef < boyut <= volume). Bu boyutlar ortalamaya
+ * katilsaydi tahmin cok kucuk cikardi. */
+static const fs_aging_size_bin_t tail1_sizes[] = { { 4096u, 0.99 }, { 16777216u, 0.01 } };
+static const fs_aging_profile_t  tail1_profile = {
+    "tail1", tiny_ages, 2u, tail1_sizes, 2u, tiny_dirs, 2u
+};
+static const fs_aging_size_bin_t tail2_sizes[] = { { 4096u, 0.9 }, { 8388608u, 0.1 } };
+static const fs_aging_profile_t  tail2_profile = {
+    "tail2", tiny_ages, 2u, tail2_sizes, 2u, tiny_dirs, 2u
 };
 
 /* ---------------- Testler ------------------------------------------- */
@@ -1245,6 +1358,345 @@ static void test_rebin_bounded(void)
     test_end("yas kovasi yerlestirme sinirli: max_ops=1 ile adim basina cagri");
 }
 
+/* STABLE'da canli dosya 0'a inerse yazi-tura silme dese de olusturma
+ * yapilir. agrawal 16 MB seed 42 eskiden 2655. islemde ERR_PLATFORM ile
+ * duruyordu (volume bos, callback hatasi yok). */
+static void test_stable_empty(void)
+{
+    run_opts_t o;
+    run_result_t r;
+
+    test_begin();
+    memset(&o, 0, sizeof(o));
+    o.profile = &fs_aging_profile_agrawal;
+    o.cfg     = base_config(16ull << 20u, 42u);
+    o.max_ops = 1u;
+    run_aging(&o, &r);
+    print_run("agrawal 16 MB", &r);
+    printf("    STABLE'da canli dosya 0 olan adim: %llu\n",
+           (unsigned long long)r.stable_empty_steps);
+    check(is_done(r.status), "durum %s", st_name(r.status));
+    check(r.stable_empty_steps > 0u, "STABLE'da canli dosya hic 0'a inmedi");
+    check(r.st.ops > 2655u, "islem %llu", (unsigned long long)r.st.ops);
+    check_common(&r);
+    test_end("STABLE'da canli dosya yok -> silme yerine olusturma");
+}
+
+/* FILL'de bos volume'de NO_SPACE: silinecek dosya yok, islem tuketilir ve
+ * sonraki islem baska boyut ceker. 64 MB'lik boyut 16 MB'a hic sigmaz;
+ * en az bir seed'de ilk olusturma(lar) bos volume'de NO_SPACE almali. */
+static void test_fill_empty_no_space(void)
+{
+    run_opts_t o;
+    run_result_t r;
+    uint32_t seed;
+    uint32_t hit = 0u;
+    uint32_t done = 0u;
+
+    test_begin();
+    for (seed = 1u; seed <= 20u; seed++) {
+        memset(&o, 0, sizeof(o));
+        o.profile = &bigmix_profile;
+        o.cfg     = base_config(16ull << 20u, seed);
+        o.max_ops = 1000u;
+        run_aging(&o, &r);
+        if (r.no_space_empty > 0u) {
+            hit++;
+        }
+        if (is_done(r.status)) {
+            done++;
+        }
+        check(is_done(r.status), "seed %u: durum %s", seed, st_name(r.status));
+        check_common(&r);
+    }
+    printf("    bigmix 16 MB seed 1-20: %u kosu DONE_*, %u kosuda bos volume'de"
+           " NO_SPACE\n", done, hit);
+    check(hit > 0u, "hicbir seed'de bos volume'de NO_SPACE olusmadi");
+    test_end("FILL'de bos volume'de NO_SPACE -> silmeden devam");
+}
+
+/* Gercek cikmaz: hicbir boyut olusturulamiyor ve silinecek dosya yok.
+ * Calisma takilmadan FS_AGING_ERR_PLATFORM ile bitmeli. */
+static void test_dead_end(void)
+{
+    run_opts_t o;
+    run_result_t r;
+    uint32_t est;
+
+    test_begin();
+
+    /* a) Her boyut volume'den buyuk: FILL'in ilk isleminde durur */
+    est = fs_aging_estimate_files(&nofit_profile, 16ull << 20u, 0.8);
+    check(est == 0u, "nofit tahmini %u, beklenen 0", est);
+    memset(&o, 0, sizeof(o));
+    o.profile  = &nofit_profile;
+    o.cfg      = base_config(16ull << 20u, 42u);
+    o.max_ops  = 1000u;
+    o.pool_cap = 16u;
+    run_aging(&o, &r);
+    print_run("nofit 16 MB", &r);
+    check(r.status == FS_AGING_ERR_PLATFORM, "durum %s", st_name(r.status));
+    check((r.st.ops == 1u) && (r.n_create == 1u) && (r.n_delete == 0u),
+          "islem %llu create %llu delete %llu", (unsigned long long)r.st.ops,
+          (unsigned long long)r.n_create, (unsigned long long)r.n_delete);
+    check(strcmp(r.err_msg, MSG_FILL_DEAD) == 0, "log '%s'", r.err_msg);
+    check_common(&r);
+
+    /* b) Platform bos volume'de bile NO_SPACE donuyor (kapasite 1 byte):
+     *    once 64 MB (volume'den buyuk) cekilirse islem tuketilip devam
+     *    edilir, en kucuk boyut (4 KB) NO_SPACE alinca durulur. En az bir
+     *    seed'de 1'den fazla islem olmali (devam yolu da sinanir). */
+    {
+        uint32_t seed;
+        uint64_t max_ops_seen = 0u;
+        for (seed = 1u; seed <= 20u; seed++) {
+            memset(&o, 0, sizeof(o));
+            o.profile     = &bigmix_profile;
+            o.cfg         = base_config(16ull << 20u, seed);
+            o.max_ops     = 1000u;
+            o.fs_capacity = 1u;
+            run_aging(&o, &r);
+            if (r.st.ops > max_ops_seen) {
+                max_ops_seen = r.st.ops;
+            }
+            check(r.status == FS_AGING_ERR_PLATFORM, "seed %u: durum %s", seed,
+                  st_name(r.status));
+            check((r.n_delete == 0u) && (r.st.creates == 0u),
+                  "seed %u: silme %llu olusturma %llu", seed,
+                  (unsigned long long)r.n_delete, (unsigned long long)r.st.creates);
+            check(r.no_space_empty == r.st.ops, "seed %u: NO_SPACE %llu, islem %llu",
+                  seed, (unsigned long long)r.no_space_empty,
+                  (unsigned long long)r.st.ops);
+            check(strcmp(r.err_msg, MSG_FILL_DEAD) == 0, "seed %u: log '%s'", seed,
+                  r.err_msg);
+            check_common(&r);
+        }
+        printf("    bigmix, kapasite 1 byte, seed 1-20: hepsi ERR_PLATFORM, en uzun"
+               " %llu islem\n", (unsigned long long)max_ops_seen);
+        check(max_ops_seen > 1u, "hicbir seed'de once 64 MB cekilmedi");
+    }
+
+    /* c) STABLE cikmazi: tek boyut = volume. FILL tek dosyayla biter,
+     *    STABLE'da dosya silinince sigan boyut kalmaz. */
+    est = fs_aging_estimate_files(&whole_profile, 16ull << 20u, 0.8);
+    memset(&o, 0, sizeof(o));
+    o.profile = &whole_profile;
+    o.cfg     = base_config(16ull << 20u, 42u);
+    o.max_ops = 1u;
+    run_aging(&o, &r);
+    print_run("whole 16 MB", &r);
+    printf("    whole tahmini %u kayit\n", est);
+    check(est >= 1u, "whole tahmini %u", est);
+    check(r.status == FS_AGING_ERR_PLATFORM, "durum %s", st_name(r.status));
+    check(r.rebin_checked != 0, "STABLE'a gecilmedi");
+    check((r.st.creates == 1u) && (r.st.deletes == 1u) && (r.st.live_files == 0u),
+          "olusturma %llu silme %llu canli %u", (unsigned long long)r.st.creates,
+          (unsigned long long)r.st.deletes, r.st.live_files);
+    check(r.st.ops <= 3u, "islem %llu", (unsigned long long)r.st.ops);
+    check(r.n_delete == 1u, "delete cagrisi %llu", (unsigned long long)r.n_delete);
+    check(strcmp(r.err_msg, MSG_STABLE_NOFIT) == 0, "log '%s'", r.err_msg);
+    check_common(&r);
+
+    /* d) STABLE'da canli dosya yok ve olusturma NO_SPACE aldi: half
+     *    (8 MB, fill 0.5) FILL'de tek dosya olusturur, STABLE'da o silinir,
+     *    platform ikinci create'ten itibaren NO_SPACE doner. */
+    memset(&o, 0, sizeof(o));
+    o.profile      = &half_profile;
+    o.cfg          = base_config(16ull << 20u, 42u);
+    o.cfg.fill_ratio = 0.5;
+    o.max_ops      = 1u;
+    o.nospace_from = 2u;
+    run_aging(&o, &r);
+    print_run("half 16 MB", &r);
+    check(r.status == FS_AGING_ERR_PLATFORM, "durum %s", st_name(r.status));
+    check(r.rebin_checked != 0, "STABLE'a gecilmedi");
+    check((r.st.creates == 1u) && (r.st.deletes == 1u) && (r.n_create == 2u) &&
+          (r.n_delete == 1u) && (r.st.live_files == 0u),
+          "olusturma %llu/%llu silme %llu/%llu canli %u",
+          (unsigned long long)r.st.creates, (unsigned long long)r.n_create,
+          (unsigned long long)r.st.deletes, (unsigned long long)r.n_delete,
+          r.st.live_files);
+    check(r.st.ops == 3u, "islem %llu", (unsigned long long)r.st.ops);
+    check(strcmp(r.err_msg, MSG_STABLE_NOSPACE) == 0, "log '%s'", r.err_msg);
+    check_common(&r);
+
+    /* e) Bos volume'de volume'e sigan boyut NO_SPACE aldi (gercek kapasite
+     *    volume'den kucuk): ayni islemde en kucuk boyut denenir, karar
+     *    ornekleme beklemeden verilir. Kapasite 1 byte: ilk islemde cikmaz.
+     *    Kapasite 6000 byte: 4 KB sigar, calisma yuk siniriyla biter. */
+    {
+        uint32_t seed;
+        for (seed = 1u; seed <= 5u; seed++) {
+            memset(&o, 0, sizeof(o));
+            o.profile     = &rare_profile;
+            o.cfg         = base_config(16ull << 20u, seed);
+            o.max_ops     = 1u;
+            o.watch       = 1;
+            o.pool_cap    = 16u;
+            o.fs_capacity = 1u;
+            run_aging(&o, &r);
+            check(r.status == FS_AGING_ERR_PLATFORM, "rare seed %u: durum %s", seed,
+                  st_name(r.status));
+            check((r.st.ops == 1u) && (r.n_create == 2u) && (r.n_delete == 0u),
+                  "rare seed %u: islem %llu create %llu delete %llu", seed,
+                  (unsigned long long)r.st.ops, (unsigned long long)r.n_create,
+                  (unsigned long long)r.n_delete);
+            check(strcmp(r.err_msg, MSG_FILL_DEAD) == 0, "rare seed %u: log '%s'",
+                  seed, r.err_msg);
+            check(r.step_violation == 0, "rare seed %u: adim siniri ihlali", seed);
+            check_common(&r);
+        }
+        memset(&o, 0, sizeof(o));
+        o.profile            = &rare_profile;
+        o.cfg                = base_config(16ull << 20u, 1u);
+        o.cfg.overwrite_runs = 1u;
+        o.max_ops            = 1u;
+        o.watch              = 1;
+        o.pool_cap           = 16u;
+        o.fs_capacity        = 6000u;
+        run_aging(&o, &r);
+        print_run("rare, kapasite 6000", &r);
+        check(r.status == FS_AGING_DONE_WORKLOAD_LIMIT, "rare 6000: durum %s",
+              st_name(r.status));
+        check((r.no_space_empty > 0u) && (r.st.creates > 0u),
+              "rare 6000: bos NO_SPACE %llu olusturma %llu",
+              (unsigned long long)r.no_space_empty, (unsigned long long)r.st.creates);
+        check(r.step_violation == 0, "rare 6000: adim siniri ihlali");
+        check(r.max_calls_work <= 2u, "rare 6000: adimda %llu cagri",
+              (unsigned long long)r.max_calls_work);
+        check_common(&r);
+
+        /* Adim bagimsizligi bu yolda da: max_ops 1000 ayni sonucu vermeli */
+        {
+            static run_result_t r2;
+            o.max_ops = 1000u;
+            o.watch   = 0;
+            run_aging(&o, &r2);
+            check(same_results(&r, &r2) != 0, "rare 6000: max_ops 1000 sonucu farkli");
+            check_common(&r2);
+        }
+    }
+    test_end("gercek cikmaz -> takilmadan FS_AGING_ERR_PLATFORM");
+}
+
+/* Havuz = fs_aging_estimate_files() (ek pay yok) ile yalnizca FILL kosulur:
+ * 8 profil x 30 seed x 3 volume, hicbirinde FS_AGING_ERR_POOL_FULL olmamali.
+ * Ayrica STABLE'da havuzun dolmasi zararsiz olmali (olusturma yerine silme). */
+static void test_estimate_pool(void)
+{
+    static const uint64_t vols[3] = { 16ull << 20u, 64ull << 20u, 256ull << 20u };
+    run_opts_t o;
+    run_result_t r;
+    uint32_t p;
+    uint32_t v;
+    uint32_t seed;
+
+    test_begin();
+    for (p = 0u; p < FS_AGING_PROFILE_COUNT; p++) {
+        fs_aging_float_t worst = 0.0;
+        uint32_t pool_full = 0u;
+        for (v = 0u; v < 3u; v++) {
+            for (seed = 1u; seed <= 30u; seed++) {
+                memset(&o, 0, sizeof(o));
+                o.profile        = fs_aging_profiles[p];
+                o.cfg            = base_config(vols[v], seed);
+                o.max_ops        = 1u;      /* sahte fs tepesi = FILL tepesi */
+                o.stop_at_stable = 1;
+                run_aging(&o, &r);
+                if (r.status == FS_AGING_ERR_POOL_FULL) {
+                    pool_full++;
+                }
+                if (((fs_aging_float_t)r.max_files / (fs_aging_float_t)r.pool_cap) > worst) {
+                    worst = (fs_aging_float_t)r.max_files / (fs_aging_float_t)r.pool_cap;
+                }
+                check((r.status == FS_AGING_RUNNING) &&
+                      (r.st.phase == FS_AGING_PHASE_STABLE),
+                      "%s %llu MB seed %u: durum %s", o.profile->name,
+                      (unsigned long long)(vols[v] >> 20u), seed, st_name(r.status));
+                check_common(&r);
+            }
+        }
+        printf("    %-10s 16/64/256 MB x seed 1-30: POOL_FULL %u, en yuksek"
+               " FILL tepesi / tahmin %.3f\n", fs_aging_profiles[p]->name,
+               pool_full, worst);
+    }
+
+    /* Dogrulama izgarasi disinda onceki taslaklarla POOL_FULL veren kosular ve
+     * yalnizca volume bosken sigan boyutlu (volume - hedef < boyut <=
+     * volume) sentetik profiller. */
+    {
+        typedef struct {
+            const fs_aging_profile_t *pr;
+            uint64_t vol;
+            fs_aging_float_t fill;
+            uint32_t seed_lo;
+            uint32_t seed_hi;
+        } est_case_t;
+        static const est_case_t cases[6] = {
+            { &fs_aging_profile_pramod,  16ull << 20u, 0.95, 849u, 849u },
+            { &fs_aging_profile_wang_os,  4ull << 20u, 0.8,  152u, 152u },
+            { &fs_aging_profile_wang_os,  8ull << 20u, 0.95, 1892u, 1892u },
+            { &fs_aging_profile_wang_os, 16ull << 20u, 0.3,  1892u, 1892u },
+            { &tail1_profile,            16ull << 20u, 0.8,  1u,   20u },
+            { &tail2_profile,            16ull << 20u, 0.8,  1u,   20u }
+        };
+        uint32_t k;
+        for (k = 0u; k < 6u; k++) {
+            uint32_t pool_full = 0u;
+            uint32_t peak = 0u;
+            for (seed = cases[k].seed_lo; seed <= cases[k].seed_hi; seed++) {
+                memset(&o, 0, sizeof(o));
+                o.profile         = cases[k].pr;
+                o.cfg             = base_config(cases[k].vol, seed);
+                o.cfg.fill_ratio  = cases[k].fill;
+                o.max_ops         = 1u;
+                o.stop_at_stable  = 1;
+                run_aging(&o, &r);
+                if (r.status == FS_AGING_ERR_POOL_FULL) {
+                    pool_full++;
+                }
+                if (r.max_files > peak) {
+                    peak = r.max_files;
+                }
+                check((r.status == FS_AGING_RUNNING) &&
+                      (r.st.phase == FS_AGING_PHASE_STABLE),
+                      "%s %llu MB fill %.2f seed %u: durum %s", o.profile->name,
+                      (unsigned long long)(cases[k].vol >> 20u), cases[k].fill, seed,
+                      st_name(r.status));
+                check_common(&r);
+            }
+            printf("    %-10s %llu MB fill %.2f seed %u-%u: tahmin %u, en yuksek FILL"
+                   " tepesi %u, POOL_FULL %u\n", cases[k].pr->name,
+                   (unsigned long long)(cases[k].vol >> 20u), cases[k].fill,
+                   cases[k].seed_lo, cases[k].seed_hi, r.pool_cap, peak, pool_full);
+        }
+        /* Guvenli sinir yok: 0 byte'lik boyutu olan meyer, fill 1.0 */
+        check(fs_aging_estimate_files(&fs_aging_profile_meyer, 16ull << 20u, 1.0) ==
+              0xFFFFFFFFu, "meyer fill 1.0 tahmini 0xFFFFFFFF degil");
+    }
+
+    /* STABLE'da havuz dolu: tiny 16 MB'ta FILL tam 3277 dosya ister; havuz
+     * tam bu kadar verilince STABLE'daki her olusturma denemesi silmeye
+     * doner ve calisma hatasiz biter. */
+    memset(&o, 0, sizeof(o));
+    o.profile  = &tiny_profile;
+    o.cfg      = base_config(16ull << 20u, 42u);
+    o.max_ops  = 1u;
+    o.pool_cap = 3277u;
+    run_aging(&o, &r);
+    print_run("tiny 16 MB havuz 3277", &r);
+    printf("    STABLE'da havuz dolu adim: %llu, tiny tahmini %u\n",
+           (unsigned long long)r.stable_pool_full,
+           fs_aging_estimate_files(&tiny_profile, 16ull << 20u, 0.8));
+    check(is_done(r.status), "durum %s", st_name(r.status));
+    check(r.stable_pool_full > 0u, "STABLE'da havuz hic dolmadi");
+    check(r.max_files <= 3277u, "havuzdan fazla dosya: %u", r.max_files);
+    check(fs_aging_estimate_files(&tiny_profile, 16ull << 20u, 0.8) >= 3277u,
+          "tiny tahmini FILL ihtiyacindan kucuk");
+    check_common(&r);
+    test_end("havuz = fs_aging_estimate_files(): FILL'de POOL_FULL yok");
+}
+
 /* ---------------- main ---------------------------------------------- */
 
 static void run_or_skip(void (*fn)(void), const char *name)
@@ -1273,6 +1725,10 @@ int main(void)
     run_or_skip(test_determinism,       "determinizm");
     run_or_skip(test_step_independence, "adim bagimsizligi");
     run_or_skip(test_rebin_bounded,     "yas kovasi yerlestirme sinirli");
+    run_or_skip(test_stable_empty,      "STABLE'da canli dosya yok");
+    run_or_skip(test_fill_empty_no_space, "FILL'de bos volume'de NO_SPACE");
+    run_or_skip(test_dead_end,          "gercek cikmaz");
+    run_or_skip(test_estimate_pool,     "havuz = tahmin");
 
     printf("EDGE SUMMARY: passed=%d failed=%d skipped=%d\n",
            g_passed_total, g_failed_total, g_skipped_total);
