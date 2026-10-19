@@ -16,6 +16,8 @@
  * Calisma asamalari (hepsi fs_aging_step() icinde, parca parca yurur):
  *   SETUP  : profilin gerektirdigi dizin agaci olusturulur.
  *   FILL   : volume, fill_ratio oranina kadar profile gore doldurulur.
+ *            Sonunda dosyalar islem basina FS_AGING_REBIN_CHUNK kayit
+ *            taranarak yas kovalarina yerlestirilir (asama FILL gorunur).
  *   STABLE : rastgele olustur/sil islemleriyle yas, boyut ve dizin
  *            dagilimlari profile yakinsatilir.
  *
@@ -51,6 +53,13 @@ extern "C" {
  * dagilimlar daha hizli yakinsar, islem basina maliyet artar. */
 #ifndef FS_AGING_DELETE_SAMPLES
 #define FS_AGING_DELETE_SAMPLES  32u
+#endif
+
+/* FILL -> STABLE gecisinde doldurma dosyalari yas kovalarina parca parca
+ * yerlestirilir; her islemde en fazla bu kadar havuz kaydi taranir.
+ * Boylece tek bir fs_aging_step() suresi havuz boyutundan bagimsizdir. */
+#ifndef FS_AGING_REBIN_CHUNK
+#define FS_AGING_REBIN_CHUNK     1024u
 #endif
 
 /* Kayan noktali tip. ARINC653 port'u float8_gt ile ayni boyutta
@@ -224,6 +233,8 @@ typedef struct {
     fs_aging_phase_t  phase;
     uint32_t          setup_dir_bin;     /* SETUP asamasi imleci */
     uint32_t          setup_sibling;
+    uint32_t          rebin_active;      /* yas kovasi yerlestirme suruyor  */
+    uint32_t          rebin_cursor;      /* siradaki taranacak havuz kaydi  */
 
     uint64_t rng_state;
     uint64_t tick;
@@ -266,7 +277,9 @@ fs_aging_status_t fs_aging_init(fs_aging_ctx_t             *ctx,
                                 uint32_t                    pool_capacity);
 
 /* En fazla max_ops islem yapar ve doner (SETUP'ta bir islem = bir yaprak
- * dizin, diger asamalarda bir dosya olusturma ya da silme). */
+ * dizin, FILL sonundaki yas kovasi yerlestirmede en fazla
+ * FS_AGING_REBIN_CHUNK kayit taramasi, diger durumlarda bir dosya
+ * olusturma ya da silme). */
 fs_aging_status_t fs_aging_step(fs_aging_ctx_t *ctx, uint32_t max_ops);
 
 /* Guncel istatistikleri kopyalar. */

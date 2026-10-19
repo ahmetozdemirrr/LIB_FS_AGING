@@ -14,6 +14,10 @@
  *  - confidence parametresi, yas dagiliminin toplam varyasyon mesafesine
  *    (0.5 * sum|gercek - hedef|) gore yorumlanir: 0.9 icin hata <= 0.1
  *    oldugunda durulur. Boylece ki-kare CDF'si ve libm gerekmez.
+ *  - FILL'den STABLE'a geciste doldurma dosyalari yas kovalarina tek
+ *    seferde degil, islem basina FS_AGING_REBIN_CHUNK kayit taranarak
+ *    yerlestirilir; tek bir fs_aging_step() suresi havuz boyutundan
+ *    bagimsiz kalir. Bu ara islemler tick ve rastgele sayi tuketmez.
  *
  * Bu dosya libc kullanmaz.
  */
@@ -23,6 +27,10 @@
 #define NONE_U32       0xFFFFFFFFu
 #define FREE_DIR_BIN   0xFFFFu
 #define MAX_SIBLINGS   0xFFFFu
+
+#if (FS_AGING_REBIN_CHUNK) < 1
+#error "FS_AGING_REBIN_CHUNK en az 1 olmali"
+#endif
 
 /* ================================================================== */
 /* Yardimcilar                                                         */
@@ -522,7 +530,9 @@ static uint64_t calc_convergence_tick(const fs_aging_ctx_t *c)
     return (T > 0.0) ? (uint64_t)T : 0u;
 }
 
-static void enter_stable(fs_aging_ctx_t *c)
+/* Doldurma hedefe ulastiginda bir kez: T ve yas esikleri hesaplanir,
+ * yas kovasi yerlestirme ara asamasi baslatilir. */
+static void begin_rebin(fs_aging_ctx_t *c)
 {
     uint32_t i;
 
@@ -533,17 +543,35 @@ static void enter_stable(fs_aging_ctx_t *c)
             (uint64_t)(c->age_ratio[i] * (fs_aging_float_t)c->convergence_tick);
         c->count_age[i] = 0u;
     }
+    c->rebin_cursor = 0u;
+    c->rebin_active = 1u;
+}
 
-    /* Doldurma sirasinda olusan dosyalari yas kovalarina yerlestir.
-     * Havuz boyutunda tek seferlik bir tarama. */
-    for (i = 0u; i < c->pool_high_water; i++) {
+/* Yas kovasi yerlestirme: doldurma sirasinda olusan dosyalar, islem basina
+ * en fazla FS_AGING_REBIN_CHUNK havuz kaydi taranarak yas kovalarina
+ * yerlestirilir. Bu islemler tick'i ilerletmez ve rastgele sayi cekmez;
+ * bu sirada dosya da olusturulmaz/silinmez, havuz sabit kalir. Ara asama
+ * bitene kadar disariya FS_AGING_PHASE_FILL raporlanir. */
+static void rebin_one(fs_aging_ctx_t *c)
+{
+    uint32_t remaining = c->pool_high_water - c->rebin_cursor;
+    uint32_t n = (remaining < FS_AGING_REBIN_CHUNK)
+                 ? remaining : FS_AGING_REBIN_CHUNK;
+    uint32_t end = c->rebin_cursor + n;
+    uint32_t i;
+
+    for (i = c->rebin_cursor; i < end; i++) {
         if (c->pool[i].dir_bin != FREE_DIR_BIN) {
             c->count_age[age_bin_of(c, c->pool[i].birth_tick)]++;
         }
     }
+    c->rebin_cursor = end;
 
-    c->phase = FS_AGING_PHASE_STABLE;
-    log_msg(c, "fs_aging: doldurma bitti, kararli aging basladi");
+    if (c->rebin_cursor >= c->pool_high_water) {
+        c->rebin_active = 0u;
+        c->phase = FS_AGING_PHASE_STABLE;
+        log_msg(c, "fs_aging: doldurma bitti, kararli aging basladi");
+    }
 }
 
 static void check_workload(fs_aging_ctx_t *c)
@@ -558,8 +586,14 @@ static void fill_one(fs_aging_ctx_t *c)
 {
     create_result_t r;
 
+    if (c->rebin_active != 0u) {
+        rebin_one(c);
+        return;
+    }
     if (c->live_bytes >= c->target_live_bytes) {
-        enter_stable(c);
+        /* Ilk parca ayni islemde taranir (havuz bossa asama hemen biter) */
+        begin_rebin(c);
+        rebin_one(c);
         return;
     }
 
@@ -579,6 +613,15 @@ static void fill_one(fs_aging_ctx_t *c)
     }
 }
 
+/* Kararli aging: her islemde 50/50 yazi-tura ile olusturma ya da silme.
+ * Orijinaldeki performStableAging (geriatrix.cpp:901-905) gibi doluluk
+ * hedefine bakan bir geri besleme yoktur; hedef yalnizca FILL'in sonunu
+ * belirler. Bu yuzden canli dosya sayisi (ve onu izleyen canli veri)
+ * hedef etrafinda sapmasiz bir rastgele yuruyus yapar ve hedeften
+ * sapabilir. Bu orijinal davranistir, bilerek ayni birakildi; sapmayi
+ * bir bantla sinirlamak orijinalden sapma olur ve kullanici onayi ister.
+ * Not: canli dosya sayisi 0'a inerse ve yazi-tura silme derse
+ * do_delete() FS_AGING_ERR_PLATFORM ile durur. */
 static void stable_one(fs_aging_ctx_t *c)
 {
     int need_delete = 1;
@@ -682,6 +725,11 @@ static uint32_t max_path_len(const fs_aging_profile_t *pr, const char *mount)
     for (i = 0u; i < pr->dir_count; i++) {
         uint32_t depth = pr->dirs[i].depth;
         uint32_t len = str_len(mount);
+        if (depth > FS_AGING_PATH_MAX) {
+            /* Her seviye en az 3 byte: bu satir hicbir yola sigamaz. Dongu
+             * derinlikle uzamasin ve len tasmasin diye hemen donulur. */
+            return FS_AGING_PATH_MAX + 1u;
+        }
         if (depth > 0u) {
             uint32_t leaf = (pr->dirs[i].sibling_dirs != 0u)
                             ? pr->dirs[i].sibling_dirs : depth;
@@ -854,7 +902,10 @@ void fs_aging_get_stats(const fs_aging_ctx_t *ctx, fs_aging_stats_t *out)
     out->workload_bytes  = ctx->workload_bytes;
     out->live_files      = ctx->live_files;
     out->convergence_ops = ctx->convergence_tick;
-    out->age_error       = (ctx->convergence_tick != 0u) ? age_error(ctx) : 1.0;
+    /* Yas kovasi yerlestirme yarim kaldiysa (surerken ya da sure siniri
+     * bu sirada dolduysa) sayaclar eksiktir: hata 1.0 raporlanir. */
+    out->age_error       = ((ctx->convergence_tick != 0u) &&
+                            (ctx->rebin_active == 0u)) ? age_error(ctx) : 1.0;
     out->elapsed_ms      = ctx->elapsed_ms;
 }
 
@@ -897,7 +948,9 @@ int fs_aging_get_bin(const fs_aging_ctx_t *ctx, fs_aging_dist_t dist,
         break;
     }
     *ideal  = ideals[index];
-    *actual = fraction(ctx, counts[index]);
+    /* Yarim kalan yas kovasi yerlestirmede FILL'deki gibi 0 raporlanir */
+    *actual = ((dist == FS_AGING_DIST_AGE) && (ctx->rebin_active != 0u))
+              ? 0.0 : fraction(ctx, counts[index]);
     return 0;
 }
 
