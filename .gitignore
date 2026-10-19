@@ -22,3 +22,6 @@ Thumbs.db
 
 # Referans Geriatrix klonu (salt okunur, repoya dahil degil)
 geriatrix/
+
+# Local host tests (not part of the library)
+TEST/

@@ -3,7 +3,7 @@
 gen_profiles.py - Geriatrix profil dosyalarindan C tablosu uretir.
 
 Girdi : <geriatrix>/profiles/<ad>/{age,size,dir}_distribution.txt
-Cikti : CORE/src/fs_aging_profiles.c (varsayilan)
+Cikti : FS_AGING_CORE/src/fs_aging_profiles.c (varsayilan)
 
 Dosya formati (her uc dosya icin):
     <N>                      ilk satir: veri satiri sayisi
@@ -381,19 +381,19 @@ def find_geriatrix(repo):
 def main(argv):
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description="Geriatrix profillerinden "
-                                 "CORE/src/fs_aging_profiles.c uretir.")
+                                 "FS_AGING_CORE/src/fs_aging_profiles.c uretir.")
     ap.add_argument("--geriatrix", help="Geriatrix klonu (varsayilan: "
                     "<repo>/../geriatrix, sonra <repo>/geriatrix)")
-    ap.add_argument("--out", default=os.path.join(repo, "CORE", "src",
+    ap.add_argument("--out", default=os.path.join(repo, "FS_AGING_CORE", "src",
                                                   "fs_aging_profiles.c"),
-                    help="cikti dosyasi (varsayilan: CORE/src/fs_aging_profiles.c)")
+                    help="cikti dosyasi (varsayilan: FS_AGING_CORE/src/fs_aging_profiles.c)")
     ap.add_argument("--mount", default="/fs0",
                     help="yol uzunlugu raporu icin mount point (varsayilan: /fs0)")
     args = ap.parse_args(argv)
 
     try:
         root = args.geriatrix if args.geriatrix else find_geriatrix(repo)
-        header = os.path.join(repo, "CORE", "include", "fs_aging.h")
+        header = os.path.join(repo, "FS_AGING_CORE", "include", "fs_aging.h")
         max_bins = read_header_define(header, "FS_AGING_MAX_BINS")
         path_max = read_header_define(header, "FS_AGING_PATH_MAX")
 

@@ -34,7 +34,7 @@ LIB_FS_AGING/
 ├── AGENT_PROMPT.md              # bu dosya
 ├── README.md                    # (yazılacak)
 ├── LICENSE.geriatrix            # (eklenecek) orijinal BSD-2 lisans metni
-├── CORE/
+├── FS_AGING_CORE/
 │   ├── include/
 │   │   ├── fs_aging.h           # MEVCUT: dış API + platform arayüzü + tipler
 │   │   └── fs_aging_profiles.h  # (yazılacak)
@@ -55,7 +55,7 @@ Her alt kütüphanede `include/` ve `src/` ayrımı korunmalı. Gereksiz dosya v
 
 ## 5. Mevcut tasarım (değiştirmeden önce anla)
 
-**Katmanlar.** CORE saf C99'dur. Hiçbir OS, APEX veya POSIX header'ı include etmez, libc fonksiyonu çağırmaz (yalnızca `stdint.h` ve `stddef.h`), bellek ayırmaz. Dosya sistemine sadece `fs_aging_platform_t` içindeki callback'ler üzerinden erişir: `create_file`, `delete_file`, `make_dir` zorunlu; `now_ms` ve `log` opsiyonel. Port katmanları bu yapıyı doldurur.
+**Katmanlar.** FS_AGING_CORE saf C99'dur. Hiçbir OS, APEX veya POSIX header'ı include etmez, libc fonksiyonu çağırmaz (yalnızca `stdint.h` ve `stddef.h`), bellek ayırmaz. Dosya sistemine sadece `fs_aging_platform_t` içindeki callback'ler üzerinden erişir: `create_file`, `delete_file`, `make_dir` zorunlu; `now_ms` ve `log` opsiyonel. Port katmanları bu yapıyı doldurur.
 
 **Bellek.** Dosya kayıt havuzunu (`fs_aging_file_t`, kayıt başına 24 byte) çağıran taraf verir. ARINC tarafında bu statik bir dizidir. Gerekli kapasite `fs_aging_estimate_files()` ile tahmin edilir; %25 pay önerilir. Context (`fs_aging_ctx_t`) de çağıran tarafta durur.
 
@@ -79,7 +79,7 @@ Her alt kütüphanede `include/` ve `src/` ayrımı korunmalı. Gereksiz dosya v
 
 ## 6. Kesin kurallar
 
-1. CORE'a OS/APEX/POSIX header'ı, libc çağrısı, `malloc`, özyineleme veya VLA ekleme.
+1. FS_AGING_CORE'a OS/APEX/POSIX header'ı, libc çağrısı, `malloc`, özyineleme veya VLA ekleme.
 2. `fs_aging.h` içindeki **public API'yi** (fonksiyon imzaları, `fs_aging_platform_t`, profil ve config tipleri) kullanıcıya sormadan değiştirme. POSIX ekibiyle aradaki sözleşme bu. Context'in iç alanları değişebilir.
 3. Kodlama stili mevcut dosyalarla aynı kalmalı: C99, `uint32_t`/`uint64_t` gibi sabit genişlikli tipler, işaretsiz sabitlerde `u` son eki, her `if`/`for` gövdesinde süslü parantez, statik yardımcı fonksiyonlar. Yorumlar Türkçe ve ASCII karakterle (ş/ğ/ı yerine s/g/i) yazılır.
 4. APEX veya şirket API'si imzası **uydurma**. Gerçek header'lar yoksa kullanıcıdan iste. Beklerken çalışmak gerekiyorsa `TEST/stubs/` altında açıkça `/* STUB - gercek header ile degistirilecek */` diye işaretlenmiş minimal bir stub kullan ve her varsayımı listele.
@@ -89,8 +89,8 @@ Her alt kütüphanede `include/` ve `src/` ayrımı korunmalı. Gereksiz dosya v
 ## 7. Kalan işler (sırayla)
 
 ### Görev 1 — Profil tabloları
-- `TOOLS/gen_profiles.py`: `../geriatrix/profiles/*/` altındaki 8 profili (`agrawal`, `dabre`, `douceur`, `grundman`, `meyer`, `pramod`, `wang_lanl`, `wang_os`) okuyup `CORE/src/fs_aging_profiles.c` üretir. Dosya formatı: ilk satır satır sayısı, sonra `age: <eşik> <ağırlık>`, `size: <byte> <ağırlık>`, `dir: <derinlik> <ağırlık> <kardeş_dizin>`. Dosya sonundaki "Format:" açıklama bloğunu yok say.
-- `CORE/include/fs_aging_profiles.h`: her profil için `extern const fs_aging_profile_t fs_aging_profile_<ad>;`, ayrıca tüm profilleri içeren bir dizi, bunun eleman sayısı ve `const fs_aging_profile_t *fs_aging_profile_find(const char *name);` fonksiyonu. Bu fonksiyon libc'siz yazılmalı.
+- `TOOLS/gen_profiles.py`: `../geriatrix/profiles/*/` altındaki 8 profili (`agrawal`, `dabre`, `douceur`, `grundman`, `meyer`, `pramod`, `wang_lanl`, `wang_os`) okuyup `FS_AGING_CORE/src/fs_aging_profiles.c` üretir. Dosya formatı: ilk satır satır sayısı, sonra `age: <eşik> <ağırlık>`, `size: <byte> <ağırlık>`, `dir: <derinlik> <ağırlık> <kardeş_dizin>`. Dosya sonundaki "Format:" açıklama bloğunu yok say.
+- `FS_AGING_CORE/include/fs_aging_profiles.h`: her profil için `extern const fs_aging_profile_t fs_aging_profile_<ad>;`, ayrıca tüm profilleri içeren bir dizi, bunun eleman sayısı ve `const fs_aging_profile_t *fs_aging_profile_find(const char *name);` fonksiyonu. Bu fonksiyon libc'siz yazılmalı.
 - Üretilen dosyanın başında "otomatik üretildi, elle düzenleme" uyarısı bulunmalı. Çıktı deterministik olmalı: aynı girdi her zaman aynı dosyayı üretmeli.
 - Kabul: her profil `FS_AGING_MAX_BINS` (48) sınırına uyuyor (en büyüğü `pramod`, 37 dizin satırı). Script her profil için `mount="/fs0"` ile en uzun yol uzunluğunu raporluyor. Bu sayı ARINC dosya sistemi yol limitiyle karşılaştırılacak.
 

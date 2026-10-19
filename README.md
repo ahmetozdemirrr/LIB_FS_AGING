@@ -1,6 +1,6 @@
 # LIB_FS_AGING
 
-Dosya sistemi yaşlandırma (aging) kütüphanesi. Saf C99 ile yazılmış, platformdan bağımsız bir çekirdek (CORE) ve bu çekirdeği bir işletim sistemine bağlayan port katmanlarından oluşur.
+Dosya sistemi yaşlandırma (aging) kütüphanesi. Saf C99 ile yazılmış, platformdan bağımsız bir çekirdek (FS_AGING_CORE) ve bu çekirdeği bir işletim sistemine bağlayan port katmanlarından oluşur.
 
 Bu belge iki okur için yazıldı:
 
@@ -48,7 +48,7 @@ LIB_FS_AGING/
 ├── AGENT_PROMPT.md              # geliştirme talimatı (kodlama ajanı için)
 ├── README.md                    # bu belge
 ├── LICENSE.geriatrix            # orijinal Geriatrix BSD-2-Clause lisans metni
-├── CORE/                        # platformdan bağımsız çekirdek (saf C99)
+├── FS_AGING_CORE/                        # platformdan bağımsız çekirdek (saf C99)
 │   ├── include/
 │   │   ├── fs_aging.h           # dış API, platform arayüzü, tipler, derleme limitleri
 │   │   └── fs_aging_profiles.h  # hazır 8 profilin bildirimleri
@@ -70,9 +70,9 @@ LIB_FS_AGING/
 - **POSIX port'u** bu repoda yazılmaz. Ayrı ekip tarafından [bölüm 7](#7-posix-port-sözleşmesi)'deki sözleşmeye göre yazılır.
 - Referans için klonlanan `geriatrix/` klasörü (varsa) salt okunurdur ve `.gitignore` ile repo dışında tutulur.
 
-Bir projeye eklemek için gereken tek şey: include yolu `CORE/include`, derlenecek dosyalar `CORE/src/fs_aging.c` ve hazır profiller kullanılacaksa `CORE/src/fs_aging_profiles.c`.
+Bir projeye eklemek için gereken tek şey: include yolu `FS_AGING_CORE/include`, derlenecek dosyalar `FS_AGING_CORE/src/fs_aging.c` ve hazır profiller kullanılacaksa `FS_AGING_CORE/src/fs_aging_profiles.c`.
 
-> **libc'siz hedefler (ARINC 653 / RTOS):** Kaynak kod hiçbir libc fonksiyonu çağırmaz. Ancak gcc, normal (hosted) derlemede `-O2`/`-O3` ile `fs_aging_init()` içindeki bayt sıfırlama döngüsünü bir `memset` çağrısına çevirir; nesne dosyasında tanımsız `memset` sembolü oluşur (`nm -u` ile görülür). Hedefte `memset` yoksa CORE'u `-ffreestanding` (ya da `-fno-tree-loop-distribute-patterns`) ile derleyin; bu host'ta `-ffreestanding` ile `fs_aging.o` ve `fs_aging_profiles.o`'da tanımsız sembol kalmadığı doğrulandı. Diğer seçenek, hedefin `memset` sağlamasıdır.
+> **libc'siz hedefler (ARINC 653 / RTOS):** Kaynak kod hiçbir libc fonksiyonu çağırmaz. Ancak gcc, normal (hosted) derlemede `-O2`/`-O3` ile `fs_aging_init()` içindeki bayt sıfırlama döngüsünü bir `memset` çağrısına çevirir; nesne dosyasında tanımsız `memset` sembolü oluşur (`nm -u` ile görülür). Hedefte `memset` yoksa FS_AGING_CORE'u `-ffreestanding` (ya da `-fno-tree-loop-distribute-patterns`) ile derleyin; bu host'ta `-ffreestanding` ile `fs_aging.o` ve `fs_aging_profiles.o`'da tanımsız sembol kalmadığı doğrulandı. Diğer seçenek, hedefin `memset` sağlamasıdır.
 
 ### Derleme zamanı limitleri
 
@@ -490,13 +490,13 @@ typedef struct {
 
 ## 8. Profiller ve `gen_profiles.py`
 
-Hazır 8 profil `CORE/include/fs_aging_profiles.h` içinde bildirilir:
+Hazır 8 profil `FS_AGING_CORE/include/fs_aging_profiles.h` içinde bildirilir:
 
 - `fs_aging_profile_agrawal`, `_dabre`, `_douceur`, `_grundman`, `_meyer`, `_pramod`, `_wang_lanl`, `_wang_os`
 - `fs_aging_profiles[FS_AGING_PROFILE_COUNT]` (alfabetik sıra, `FS_AGING_PROFILE_COUNT` = 8)
 - `fs_aging_profile_find(name)`: Profil adı Geriatrix'teki klasör adıdır (ör. `"agrawal"`).
 
-Tablolar `CORE/src/fs_aging_profiles.c` içindedir. Bu dosya **otomatik üretilir, elle düzenlenmez.** Değişiklik gerekiyorsa script ya da kaynak profil dosyaları değiştirilip dosya yeniden üretilir.
+Tablolar `FS_AGING_CORE/src/fs_aging_profiles.c` içindedir. Bu dosya **otomatik üretilir, elle düzenlenmez.** Değişiklik gerekiyorsa script ya da kaynak profil dosyaları değiştirilip dosya yeniden üretilir.
 
 ```
 py -3 TOOLS/gen_profiles.py                 # Windows
@@ -506,7 +506,7 @@ python3 TOOLS/gen_profiles.py               # Linux
 | Seçenek | Varsayılan | Açıklama |
 |---|---|---|
 | `--geriatrix <klasör>` | `<repo>/../geriatrix`, yoksa `<repo>/geriatrix` | Geriatrix klonu (`profiles/<ad>/*.txt` okunur) |
-| `--out <dosya>` | `CORE/src/fs_aging_profiles.c` | Çıktı dosyası |
+| `--out <dosya>` | `FS_AGING_CORE/src/fs_aging_profiles.c` | Çıktı dosyası |
 | `--mount <yol>` | `/fs0` | Yalnızca yol uzunluğu raporunu etkiler; üretilen dosyayı değiştirmez |
 
 - Yalnızca Python standart kütüphanesini kullanır.
@@ -572,7 +572,7 @@ Referans sonuç (Agrawal, 256 MB, `fill_ratio` 0.8, seed 42, `max_ops` 1000, `co
 
 ## 10. Lisans
 
-Bu kütüphane Geriatrix'in türev çalışmasıdır. Algoritma ve `CORE/src/fs_aging_profiles.c` içindeki profil verileri orijinal Geriatrix reposundan alınmıştır:
+Bu kütüphane Geriatrix'in türev çalışmasıdır. Algoritma ve `FS_AGING_CORE/src/fs_aging_profiles.c` içindeki profil verileri orijinal Geriatrix reposundan alınmıştır:
 
 - Copyright (c) 2018, Carnegie Mellon University. All rights reserved.
 - Lisans: BSD-2-Clause. Tam metin repo kökündeki [`LICENSE.geriatrix`](LICENSE.geriatrix) dosyasındadır ve korunmalıdır.
