@@ -77,6 +77,7 @@ Bir projeye eklemek için gereken tek şey: include yolu `FS_AGING_CORE/include`
 | `FS_AGING_MAX_BINS` | `48u` | Bir profildeki yaş, boyut ve dizin satırı sayısı üst sınırı |
 | `FS_AGING_DELETE_SAMPLES` | `32u` | Silinecek dosya seçilirken bakılan rastgele aday sayısı |
 | `FS_AGING_REBIN_CHUNK` | `1024u` | FILL sonundaki yaş kovası yerleştirmede işlem başına taranan kayıt sayısı (en az 1) |
+| `FS_AGING_FILL_STALL_OPS` | `100000u` | FILL'de canlı veri yeni bir en yüksek değere çıkmadan art arda geçebilecek işlem sayısı; aşılırsa `FS_AGING_ERR_FILL_UNREACHABLE` |
 
 > **Dikkat:** Bu makrolar `fs_aging_ctx_t` yapısının düzenini ve boyutunu değiştirir. `fs_aging.h`'yi include eden **tüm** derleme birimleri aynı değerlerle derlenmelidir. `FS_AGING_DELETE_SAMPLES` değiştirilirse aynı seed farklı bir işlem dizisi üretir.
 
@@ -100,7 +101,7 @@ Bir projeye eklemek için gereken tek şey: include yolu `FS_AGING_CORE/include`
 Tüm aşamalar `fs_aging_step()` içinde, parça parça ilerler. Güncel aşama `stats.phase` alanında görülür.
 
 1. **SETUP** — Profilin gerektirdiği dizin ağacı oluşturulur. Her işlemde bir yaprak dizin ve gerekiyorsa üst dizinleri oluşturulur.
-2. **FILL** — Volume, `volume_bytes × fill_ratio` canlı veriye ulaşana kadar profil dağılımından rastgele örneklenen boyutlarla doldurulur. Oluşturma `NO_SPACE` alırsa yerine bir dosya silinir. Volume'de hiç canlı dosya yoksa silme yapılmaz: boyut volume'den büyükse işlem tüketilir ve sonraki işlem yeni bir boyut çeker; boyut volume'e sığdığı hâlde `NO_SPACE` alındıysa (gerçek kapasite `volume_bytes`'tan küçük) aynı işlemde ağırlığı pozitif en küçük boyut denenir. FILL hedefe tam ulaşana kadar sürer; hedef ulaşılamazsa (ör. `fill_ratio` 1.0'a çok yakın, gerçek kapasite `volume_bytes`'tan küçük ya da boyutlar hedefi tam dolduramıyor) oluştur/sil döngüsünde kalabilir. Bu yüzden böyle durumlarda `overwrite_runs` veya `time_limit_s` verin.
+2. **FILL** — Volume, `volume_bytes × fill_ratio` canlı veriye ulaşana kadar profil dağılımından rastgele örneklenen boyutlarla doldurulur. Oluşturma `NO_SPACE` alırsa yerine bir dosya silinir. Volume'de hiç canlı dosya yoksa silme yapılmaz: boyut volume'den büyükse işlem tüketilir ve sonraki işlem yeni bir boyut çeker; boyut volume'e sığdığı hâlde `NO_SPACE` alındıysa (gerçek kapasite `volume_bytes`'tan küçük) aynı işlemde ağırlığı pozitif en küçük boyut denenir. FILL hedefe ulaşana kadar sürer. Hedefe ulaşılamıyorsa (ör. `fill_ratio` 1.0'a çok yakın ya da gerçek boş alan `volume_bytes × fill_ratio`'dan küçük) çekirdek bunu kendisi fark eder: canlı veri art arda `FS_AGING_FILL_STALL_OPS` (100000) işlem boyunca yeni bir en yüksek değere çıkmazsa çalışma `FS_AGING_ERR_FILL_UNREACHABLE` ile biter. Bu kontrol rastgele sayı çekmez; tetiklenmediği çalışmaların sonucu değişmez.
    - **Yaş kovası yerleştirme (ara adım):** Doldurma hedefe ulaşınca, FILL'de oluşan dosyalar her işlemde en fazla `FS_AGING_REBIN_CHUNK` kayıt taranarak yaş kovalarına yerleştirilir. Bu sırada aşama hâlâ `FS_AGING_PHASE_FILL` olarak raporlanır. Dosya oluşturulmaz ya da silinmez; `stats.ops` (tick) ilerlemez ve rastgele sayı çekilmez.
 3. **STABLE** — Her işlemde 50/50 yazı-tura ile oluşturma veya silme yapılır; yaş, boyut ve dizin dağılımları profile yakınsatılır. Canlı dosya yoksa yazı-tura silme dese de oluşturma yapılır (orijinalden bilinçli fark, bkz. [bölüm 6](#6-orijinal-geriatrixten-farklar)).
 4. **DONE** — `FS_AGING_RUNNING` dışında bir durumda aşama `FS_AGING_PHASE_DONE` olur.
@@ -136,6 +137,7 @@ Bir "işlem" (op) aşamaya göre şudur:
 | `FS_AGING_ERR_POOL_FULL` | **FILL** sırasında canlı dosya sayısı havuz kapasitesine ulaştı | Havuz küçük. STABLE'da havuzun dolması hata değildir (bkz. [bölüm 5](#5-bellek-boyutlandırma)). |
 | `FS_AGING_ERR_PATH_TOO_LONG` | `init`'te profilin en uzun yolu `FS_AGING_PATH_MAX`'ı aşıyor | `FS_AGING_PATH_MAX`'ı büyütün veya mount point'i kısaltın. |
 | `FS_AGING_ERR_PLATFORM` | Bir callback hata döndü; ya da hiçbir boyut oluşturulamıyor ve silinecek dosya da yok (gerçek çıkmaz) | Aging durur. Canlı dosya yokken silme gerekmesi tek başına hata **değildir**: STABLE'da oluşturma yapılır, FILL'de `NO_SPACE` alan işlem silmeden tüketilir. Çıkmaz yalnızca şu durumlarda callback hatası olmadan oluşur ve çalışma takılmadan biter: (a) FILL'de volume boşken `NO_SPACE` alındı ve ağırlığı pozitif en küçük boyut bile volume'den büyük, ya da volume'e sığan bir boyut `NO_SPACE` aldı ve en küçük boyut da (aynı işlemde denenir) `NO_SPACE` aldı (log: `"fs_aging: no profile size fits on the empty volume"`). Bu karar `NO_SPACE`'in alındığı işlemde verilir; yalnızca volume'den büyük bir boyut çekildiyse işlem tüketilir ve karar volume'e sığan bir boyut çekilen ilk işlemde verilir; (b) STABLE'da canlı dosya yok ve volume'e sığan profil boyutu yok (log: `"fs_aging: no profile size fits and no file to delete"`) ya da oluşturma `NO_SPACE` aldı (log: `"fs_aging: create got NO_SPACE and no file to delete"`). Ağırlığı pozitif hiçbir boyutu volume'e sığmayan profil için `fs_aging_estimate_files()` `0` döner. |
+| `FS_AGING_ERR_FILL_UNREACHABLE` | FILL'de canlı veri art arda `FS_AGING_FILL_STALL_OPS` işlem boyunca yeni bir en yüksek değere çıkmadı | Doluluk hedefine ulaşılamıyor (log: `"fs_aging: FILL makes no progress, target unreachable"`). Genelde `fill_ratio` çok yüksek ya da `volume_bytes` gerçek boş alandan büyük. `fill_ratio`'yu düşürün veya `volume_bytes`'ı gerçek boş alana göre verin. |
 
 `fs_aging_init()` şu durumlarda `FS_AGING_ERR_PARAM` döner:
 
@@ -248,7 +250,7 @@ int run_aging(void)
 |---|---|---|
 | `mount_point` | `-m` | Sonunda `/` olmadan, ör. `"/fs0"`. Pointer saklanır, aging boyunca geçerli kalmalıdır. |
 | `volume_bytes` | `-n` | Dosya sisteminin toplam boyutu (byte). |
-| `fill_ratio` | `-u` | Hedef doluluk, (0, 1] aralığında, ör. `0.8`. 1.0'a çok yakın değerlerde FILL hedefe ulaşamayıp oluştur/sil döngüsünde kalabilir; bu durumda `overwrite_runs` veya `time_limit_s` verin. |
+| `fill_ratio` | `-u` | Hedef doluluk, (0, 1] aralığında, ör. `0.8`. Hedefe ulaşılamazsa (ör. 1.0'a çok yakın değerler) çalışma `FS_AGING_ERR_FILL_UNREACHABLE` ile biter. |
 | `seed` | `-r` | Rastgelelik tohumu. |
 | `overwrite_runs` | `-i` | Toplam yük sınırı `overwrite_runs × volume_bytes`. 0 = sınırsız. |
 | `time_limit_s` | `-w` | Süre sınırı, **saniye** cinsinden (orijinalde dakika). 0 = sınırsız. `now_ms` gerekir. |
@@ -265,7 +267,7 @@ int run_aging(void)
 - `0xFFFFFFFF` döner (geçerli kapasite değildir; `fs_aging_init()` reddeder): sonuç 32 bite sığmıyorsa ya da güvenli sınır yoksa. İkincisi, volume'e sığan 0 byte'lık bir boyut varken FILL boyunca her zaman sığan pozitif boyut olmadığında olur (ör. `meyer` veya `wang_os` ile `fill_ratio` 1.0).
 - ARINC 653'te havuz statik bir dizidir; boyutu partition bellek bütçesine göre derleme zamanında seçilir.
 
-**Context (`fs_aging_ctx_t`).** Bu host'ta (x86_64, MSYS2 UCRT64 gcc 16.2, varsayılan limitler) `sizeof(fs_aging_ctx_t) = 3008` byte'tır. Bu sayı **host'a özeldir**: pointer boyutu, hizalama ve `FS_AGING_MAX_BINS` / `FS_AGING_PATH_MAX` değerleri değiştikçe değişir. Hedef platformda `sizeof` ile ölçün. Context'in alanları dahilidir ve değiştirilmemelidir.
+**Context (`fs_aging_ctx_t`).** Bu host'ta (x86_64, MSYS2 UCRT64 gcc 16.2, varsayılan limitler) `sizeof(fs_aging_ctx_t) = 3024` byte'tır. Bu sayı **host'a özeldir**: pointer boyutu, hizalama ve `FS_AGING_MAX_BINS` / `FS_AGING_PATH_MAX` değerleri değiştikçe değişir. Hedef platformda `sizeof` ile ölçün. Context'in alanları dahilidir ve değiştirilmemelidir.
 
 ### `fs_aging_estimate_files()` nasıl hesaplar
 
@@ -280,7 +282,7 @@ Havuz ihtiyacı, **STABLE'a geçmeden önce (FILL boyunca) ulaşılan en yüksek
 
 - Ana ızgara: 8 profil × seed 1–200 × volume {16 MB, 64 MB, 256 MB, 1 GB, 4 GB} × `fill_ratio` {0.5, 0.8, 0.95} = 24000 çalışma. Hiçbirinde `FS_AGING_ERR_POOL_FULL` oluşmadı.
 - Izgara dışı: seed 1–3000 × volume {1, 2, 4, 8, 16} MB × `fill_ratio` {0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99} (8 profil, 960000 çalışma) ve seed 201–1000 × {64, 256} MB × {0.5, 0.8, 0.95} (38400 çalışma). Hiçbirinde `POOL_FULL` oluşmadı; en yüksek "gereken / tahmin" oranı küçük volume'lerde 0,775 (`dabre` 16 MB 0.9 seed 444: 1563 / 2017), 64/256 MB'ta 0,868 (`wang_lanl` 256 MB 0.95 seed 288: 1213 / 1398). Önceki taslaklarda `POOL_FULL` veren `pramod` 16 MB 0.95 seed 849 (gereken 965, tahmin 1844), `wang_os` 4 MB 0.8 seed 152 (258 / 494) ve `wang_os` 16 MB 0.3 seed 1892 (311 / 536) artık geçer.
-- `fill_ratio` 1.0 ızgarada yoktur: FILL bu oranda hedefe ulaşamayıp oluştur/sil döngüsünde kalabilir; tahmin orada yalnızca 4. adımdaki kesin sınırdır.
+- `fill_ratio` 1.0 ızgarada yoktur: FILL bu oranda çoğu zaman hedefe ulaşamaz ve `FS_AGING_ERR_FILL_UNREACHABLE` ile biter; tahmin orada yalnızca 4. adımdaki kesin sınırdır.
 
 Ana ızgarada profil başına en yüksek "gereken havuz / tahmin" oranı:
 
@@ -374,7 +376,7 @@ typedef struct {
 | Kod | `create_file` sonrası çekirdek | `delete_file` / `make_dir` sonrası çekirdek |
 |---|---|---|
 | `FS_AGING_PLAT_OK` | Dosyayı kaydeder, `size_bytes` kadar canlı veri sayar. | Devam eder. |
-| `FS_AGING_PLAT_NO_SPACE` | Dosya **oluşmamış** kabul edilir. Aynı işlemde bir dosya silinir ve aging devam eder. Silinecek dosya yoksa silme yapılmaz ve aging devam eder (FILL'de volume'e sığan bir boyut boş volume'de `NO_SPACE` aldıysa aynı işlemde en küçük boyutla bir `create_file` daha yapılır); yalnızca oluşturma yapılamıyor ve silinecek dosya yoksa (gerçek çıkmaz, bkz. durum kodları) `FS_AGING_ERR_PLATFORM`. | `FS_AGING_ERR_PLATFORM`, aging durur. |
+| `FS_AGING_PLAT_NO_SPACE` | Dosya **oluşmamış** kabul edilir. Aynı işlemde bir dosya silinir ve aging devam eder. Silinecek dosya yoksa silme yapılmaz ve aging devam eder (FILL'de volume'e sığan bir boyut boş volume'de `NO_SPACE` aldıysa aynı işlemde en küçük boyutla bir `create_file` daha yapılır); yalnızca oluşturma yapılamıyor ve silinecek dosya yoksa (gerçek çıkmaz, bkz. durum kodları) `FS_AGING_ERR_PLATFORM`. FILL'de `NO_SPACE` yüzünden hedefe ulaşılamıyorsa (gerçek boş alan hedeften küçük) `FS_AGING_ERR_FILL_UNREACHABLE`. | `FS_AGING_ERR_PLATFORM`, aging durur. |
 | `FS_AGING_PLAT_ERROR` | `FS_AGING_ERR_PLATFORM`, aging durur. | `FS_AGING_ERR_PLATFORM`, aging durur. |
 
 `NO_SPACE` yalnızca `create_file` için anlamlıdır. `delete_file` ve `make_dir`, `OK` dışındaki **her** değerde aging'i durdurur.
@@ -385,6 +387,7 @@ typedef struct {
 - `size_bytes == 0` geçerlidir (ör. `wang_os` profilinde 0 byte dosyalar vardır). Boş dosya oluşturulur.
 - `size_bytes` 4 GiB'ı aşabilir (`pramod`'da 32 GiB'a kadar). 64 bit boyutu doğru işleyin.
 - Yer yetmiyorsa (`ENOSPC`, `EFBIG` gibi) `FS_AGING_PLAT_NO_SPACE` dönün. Bu durumda **yarım kalan dosyayı silin**. Çekirdek bu dosyayı bilmez; geride kalırsa yer kaplayan yetim bir dosya olur.
+- Çekirdek canlı veriyi `size_bytes` toplamı olarak sayar; dosya sisteminin blok yuvarlaması ve kendi yönetim verisi buna dahil değildir. `volume_bytes × fill_ratio` gerçek boş alana sığmıyorsa FILL hedefe ulaşamaz ve çalışma `FS_AGING_ERR_FILL_UNREACHABLE` ile biter. `volume_bytes` olarak gerçek kullanılabilir alanı (ör. `statvfs`: `f_bavail × f_frsize`) verin.
 - Diğer tüm hatalarda `FS_AGING_PLAT_ERROR` dönün.
 - Çekirdek bir çalışma içinde aynı yolu iki kez oluşturmaz (dosya adı tekil doğum tick'idir). Dosya zaten varsa önceki bir çalışmadan kalmıştır. Aging **boş (yeni biçimlendirilmiş) bir volume'de** başlatılmalıdır. Port, var olan dosyada `ERROR` dönebilir.
 - Üst dizinin var olduğu varsayılabilir: dizinler SETUP aşamasında oluşturulmuştur.

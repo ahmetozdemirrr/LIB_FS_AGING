@@ -607,6 +607,21 @@ static void fill_empty_no_space(fs_aging_ctx_t *c, uint32_t size_bin)
     }
 }
 
+/* FILL: stop when live data sets no new high for too many ops in a row */
+static void check_fill_progress(fs_aging_ctx_t *c)
+{
+    if (c->live_bytes > c->fill_high) {
+        c->fill_high  = c->live_bytes;
+        c->fill_stall = 0u;
+    } else {
+        c->fill_stall++;
+        if (c->fill_stall > (uint64_t)(FS_AGING_FILL_STALL_OPS)) {
+            fail(c, FS_AGING_ERR_FILL_UNREACHABLE,
+                 "fs_aging: FILL makes no progress, target unreachable");
+        }
+    }
+}
+
 static void fill_one(fs_aging_ctx_t *c)
 {
     create_result_t r;
@@ -641,6 +656,9 @@ static void fill_one(fs_aging_ctx_t *c)
 
     if (c->status == FS_AGING_RUNNING) {
         check_workload(c);
+    }
+    if (c->status == FS_AGING_RUNNING) {
+        check_fill_progress(c);
     }
 }
 
@@ -1135,6 +1153,7 @@ const char *fs_aging_status_str(fs_aging_status_t status)
     case FS_AGING_ERR_POOL_FULL:       return "fs_aging: error, pool full";
     case FS_AGING_ERR_PATH_TOO_LONG:   return "fs_aging: error, path too long";
     case FS_AGING_ERR_PLATFORM:        return "fs_aging: error, platform callback failed";
+    case FS_AGING_ERR_FILL_UNREACHABLE: return "fs_aging: error, fill target unreachable";
     default:                           return "fs_aging: unknown status";
     }
 }

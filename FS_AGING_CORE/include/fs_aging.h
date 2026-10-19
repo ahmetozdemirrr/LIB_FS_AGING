@@ -51,6 +51,12 @@ extern "C" {
 #define FS_AGING_REBIN_CHUNK     1024u
 #endif
 
+/* FILL ops in a row without a new live data high before FILL stops with
+ * FS_AGING_ERR_FILL_UNREACHABLE. */
+#ifndef FS_AGING_FILL_STALL_OPS
+#define FS_AGING_FILL_STALL_OPS  100000u
+#endif
+
 /* Floating point type used by the library. */
 typedef double fs_aging_float_t;
 
@@ -68,8 +74,10 @@ typedef enum {
                                       platform or pool)                     */
     FS_AGING_ERR_POOL_FULL,        /* pool too small during FILL            */
     FS_AGING_ERR_PATH_TOO_LONG,    /* a path exceeds FS_AGING_PATH_MAX      */
-    FS_AGING_ERR_PLATFORM          /* a callback failed, or no progress
+    FS_AGING_ERR_PLATFORM,         /* a callback failed, or no progress
                                       is possible                           */
+    FS_AGING_ERR_FILL_UNREACHABLE  /* FILL stopped making progress; the
+                                      fill target cannot be reached         */
 } fs_aging_status_t;
 
 /* Return values of the platform callbacks. */
@@ -151,9 +159,9 @@ typedef struct {
                                          e.g. "/fs0"; must stay valid
                                          during aging                       */
     uint64_t          volume_bytes;   /* volume size in bytes               */
-    fs_aging_float_t  fill_ratio;     /* fill target, 0..1, e.g. 0.8; if it
-                                         may be unreachable, also set
-                                         overwrite_runs or time_limit_s     */
+    fs_aging_float_t  fill_ratio;     /* fill target, 0..1, e.g. 0.8; an
+                                         unreachable target ends with
+                                         FS_AGING_ERR_FILL_UNREACHABLE      */
     uint32_t          seed;           /* random seed                        */
     uint32_t          overwrite_runs; /* stop after runs * volume_bytes
                                          written; 0 = no limit              */
@@ -235,6 +243,8 @@ typedef struct {
     uint64_t rng_state;
     uint64_t tick;
     uint64_t fill_ops;
+    uint64_t fill_high;
+    uint64_t fill_stall;
     uint64_t convergence_tick;
     uint64_t target_live_bytes;
     uint64_t workload_limit_bytes;
