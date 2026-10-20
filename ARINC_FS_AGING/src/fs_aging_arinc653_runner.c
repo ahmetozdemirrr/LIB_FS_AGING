@@ -3,8 +3,8 @@
  *
  * fs_aging_a653_start() checks the setup in INIT mode and creates one
  * periodic process. In NORMAL mode that process runs up to
- * ops_per_period operations per period until aging ends, then logs a
- * summary and calls on_done.
+ * ops_per_period operations per period until aging ends, then prints a
+ * summary, calls on_done and ends. Errors are printed and end the run.
  *
  * Only one aging run per partition: the pool and context are static.
  *
@@ -15,7 +15,6 @@
 #include "gzisTypes.h"
 #include "arinc653/ARINC653.h"
 #include "testUtils/lib/user/testUtils.h"
-#include "testReporter/lib/user/testReporter.h"
 #include "fs_aging_arinc653.h"
 
 static fs_aging_ctx_t           a653_ctx;
@@ -50,7 +49,7 @@ static fs_aging_status_t prepare(uint64_t volume_bytes)
 
     needed = fs_aging_estimate_files(a653_profile, volume_bytes, a653_cfg.fill_ratio);
     if ((0u == needed) || (needed > FS_AGING_A653_POOL_CAPACITY)) {
-        FS_AGING_A653_ERROR("fs_aging: pool needs %u records, capacity is %u",
+        FS_AGING_A653_PRINT("fs_aging: error: pool needs %u records, capacity is %u\r\n",
                             (unsigned int)needed,
                             (unsigned int)FS_AGING_A653_POOL_CAPACITY);
         return FS_AGING_ERR_POOL_FULL;
@@ -69,7 +68,7 @@ static fs_aging_status_t prepare(uint64_t volume_bytes)
     status = fs_aging_init(&a653_ctx, a653_profile, &cfg, &platform,
                            a653_pool, FS_AGING_A653_POOL_CAPACITY);
     if (status != FS_AGING_RUNNING) {
-        FS_AGING_A653_ERROR("fs_aging: init failed: %s", fs_aging_status_str(status));
+        FS_AGING_A653_PRINT("fs_aging: error: init failed: %s\r\n", fs_aging_status_str(status));
     }
     return status;
 }
@@ -93,14 +92,14 @@ static void finish(fs_aging_status_t status)
     if (a653_ctx.profile != NULL) {
         fs_aging_a653_print_report();
         fs_aging_get_stats(&a653_ctx, &st);
-        FS_AGING_A653_LOG("fs_aging: %s, profile %s, ops %llu, live %llu MB, "
-                          "age error %u per mille",
-                          fs_aging_status_str(status), a653_profile->name,
-                          (unsigned long long)st.ops,
-                          (unsigned long long)(st.live_bytes >> 20),
-                          per_mille(st.age_error));
+        FS_AGING_A653_PRINT("fs_aging: summary: %s, profile %s, ops %llu, live %llu MB, "
+                            "age error %u per mille\r\n",
+                            fs_aging_status_str(status), a653_profile->name,
+                            (unsigned long long)st.ops,
+                            (unsigned long long)(st.live_bytes >> 20),
+                            per_mille(st.age_error));
         if (!is_done_ok(status)) {
-            FS_AGING_A653_ERROR("fs_aging: aging failed: %s", fs_aging_status_str(status));
+            FS_AGING_A653_PRINT("fs_aging: error: aging failed: %s\r\n", fs_aging_status_str(status));
         }
     }
     if (NULL != a653_cfg.on_done) {
@@ -118,7 +117,7 @@ static void a653_aging_process(void)
     if (0u == a653_cfg.volume_bytes) {
         uint64_t free_bytes = fs_aging_a653_free_bytes(a653_cfg.mount_point);
         if (0u == free_bytes) {
-            FS_AGING_A653_ERROR("fs_aging: cannot read free space of %s",
+            FS_AGING_A653_PRINT("fs_aging: error: cannot read free space of %s\r\n",
                                 a653_cfg.mount_point);
             finish(FS_AGING_ERR_PLATFORM);
             return;
@@ -143,7 +142,7 @@ static void a653_aging_process(void)
         if (status == FS_AGING_RUNNING) {
             PERIODIC_WAIT(&return_code);
             if (NO_ERROR != return_code) {
-                FS_AGING_A653_ERROR("fs_aging: PERIODIC_WAIT failed (%d)", (int)return_code);
+                FS_AGING_A653_PRINT("fs_aging: error: PERIODIC_WAIT failed (%d)\r\n", (int)return_code);
                 status = FS_AGING_ERR_PLATFORM;
             }
         }
@@ -177,7 +176,7 @@ static fs_aging_status_t create_aging_process(void)
         START(process_id, &return_code);
     }
     if (NO_ERROR != return_code) {
-        FS_AGING_A653_ERROR("fs_aging: aging process setup failed (%d)", (int)return_code);
+        FS_AGING_A653_PRINT("fs_aging: error: aging process setup failed (%d)\r\n", (int)return_code);
         return FS_AGING_ERR_PLATFORM;
     }
     return FS_AGING_RUNNING;
@@ -190,13 +189,13 @@ fs_aging_status_t fs_aging_a653_start(const fs_aging_a653_config_t *config)
     memset(&a653_ctx, 0, sizeof(a653_ctx));
     if ((NULL == config) || (NULL == config->profile_name) ||
         (NULL == config->mount_point) || (0u == config->ops_per_period)) {
-        FS_AGING_A653_ERROR("fs_aging: invalid configuration");
+        FS_AGING_A653_PRINT("fs_aging: error: invalid configuration\r\n");
         return FS_AGING_ERR_PARAM;
     }
 
     a653_profile = fs_aging_profile_find(config->profile_name);
     if (NULL == a653_profile) {
-        FS_AGING_A653_ERROR("fs_aging: unknown profile %s", config->profile_name);
+        FS_AGING_A653_PRINT("fs_aging: error: unknown profile %s\r\n", config->profile_name);
         return FS_AGING_ERR_PARAM;
     }
     a653_cfg = *config;

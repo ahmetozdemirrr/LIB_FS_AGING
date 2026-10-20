@@ -525,7 +525,7 @@ Profil formatı (Geriatrix): ilk satır veri satırı sayısıdır. Ardından ya
 
 ## 9. ARINC 653 port'u
 
-`ARINC_FS_AGING/` çekirdeği bir ARINC 653 partition'ında çalıştırır. Test case INIT modunda aging'i hazırlar; NORMAL modda periyodik bir process her periyotta en fazla `ops_per_period` dosya işlemi yapar.
+`ARINC_FS_AGING/` çekirdeği bir ARINC 653 partition'ında çalıştırır. Bir test değil, belirli parametrelerle her seferinde aynı şekilde yaşlanmış diskler üreten bir araçtır. Uygulama INIT modunda aging'i hazırlar; NORMAL modda periyodik bir process her periyotta en fazla `ops_per_period` dosya işlemi yapar.
 
 ### Kullanım
 
@@ -534,13 +534,12 @@ Profil formatı (Geriatrix): ilk satır veri satırı sayısıdır. Ardından ya
 
 static void aging_done(fs_aging_status_t status)
 {
-    /* Hata durumu kütüphane tarafından TEST_UNRESOLVED olarak raporlandı.
-     * Başarıda burada yaşlandırılmış diskle yapılacak test yapılır. */
+    /* Özet ve varsa hata mesajı basıldı; aging process'i bundan sonra biter. */
     (void)status;
-    REPORTER_TEST_CASE_END();
 }
 
-void FS_AGING_0001()
+/* Partition INIT kodu */
+void aging_partition_init(void)
 {
     RETURN_CODE_TYPE return_code = -1;
     fs_aging_a653_config_t cfg = {
@@ -550,21 +549,22 @@ void FS_AGING_0001()
         .fill_ratio     = 0.8,
         .seed           = 42u,
         .ops_per_period = 50u,
-        .period         = MASTER_PARTITION_PERIOD,
+        .period         = AGING_PERIOD,          /* örnek: partition periyodu */
         .time_capacity  = INFINITE_TIME_VALUE,
-        .stack_size     = TEST_PROCESS_STACK_SIZE,
-        .priority       = MASTER_PROCESS_PRIORITY,
+        .stack_size     = AGING_STACK_SIZE,
+        .priority       = AGING_PRIORITY,
         .core_id        = 0u,
         .progress_every = 1000u,
         .on_done        = aging_done,
     };
 
     if (FS_AGING_RUNNING != fs_aging_a653_start(&cfg)) {
-        REPORTER_TEST_CASE_END();       /* hata zaten UNRESOLVED olarak raporlandı */
-        return;
+        return;                         /* hata mesajı basıldı */
     }
     SET_PARTITION_MODE(NORMAL, &return_code);
-    CHECK_UNRESOLVED(return_code);
+    if (NO_ERROR != return_code) {
+        TEST_PRINT("SET_PARTITION_MODE failed (%d)\r\n", (int)return_code);
+    }
 }
 ```
 
@@ -572,8 +572,9 @@ void FS_AGING_0001()
 
 - `fs_aging_a653_start()` profili, parametreleri ve havuzun yeterliliğini kontrol eder; `CREATE_PROCESS`, `INITIALIZE_PROCESS_CORE_AFFINITY` ve `START` ile aging process'ini (adı `FS_AGING`, deadline `SOFT`) oluşturur. Dosya sistemine dokunmaz.
 - `volume_bytes = 0` verilirse aging process'i başlarken mount noktasında geçici bir dosya oluşturup `GET_VOLUME_STATUS` ile `FREE_BYTES` değerini okur, dosyayı siler ve aging'i bu boyutla başlatır. Volume'ün boş olması beklenir.
-- Kütüphane bir test altyapısıdır; **PASSED/FAILED vermez.** Aging yapılamazsa (geçersiz parametre, havuz yetersiz, process kurulamadı, boş alan okunamadı, aging hatayla bitti) `TEST_UNRESOLVED` gönderir. Bitişte bir özet satırı `TEST_LOG` ile rapora, ayrıntılı dağılımlar `TEST_PRINT` ile konsola gider.
-- `on_done` aging process'inden, başarıda da hatada da bir kez çağrılır. Test case'in sonucu ve `REPORTER_TEST_CASE_END()` burada verilir.
+- Test reporter'ı kullanılmaz. Tüm çıktı `TEST_PRINT` (printf) ile basılır: ilerleme, bitişte dağılımlar ve tek satırlık özet (`fs_aging: summary: ...`). Hatalar `fs_aging: error: ...` ile başlar.
+- Hata olursa (geçersiz parametre, havuz yetersiz, process kurulamadı, boş alan okunamadı, aging hatayla bitti) mesaj basılır ve çalışma biter: INIT'te `fs_aging_a653_start()` hata kodunu döner, NORMAL modda aging process'i sonlanır.
+- `on_done` aging process'inden, başarıda da hatada da bir kez çağrılır; ardından process biter.
 - Partition başına tek aging çalışması desteklenir (havuz ve context statiktir).
 
 ### Dosya oluşturma
@@ -589,7 +590,7 @@ void FS_AGING_0001()
 | `FS_AGING_A653_POOL_CAPACITY` | `16384u` | Statik havuz kaydı (kayıt başına 24 byte, ~384 KB) |
 | `FS_AGING_A653_USE_RESIZE` | `1` | Dosya boyutlandırma yöntemi |
 | `FS_AGING_A653_MAX_FILE_SIZE` | `0xFFFFFFFF` | Dosya sisteminin kabul ettiği en büyük dosya |
-| `FS_AGING_A653_PRINT` / `_LOG` / `_ERROR` | `TEST_PRINT` / `TEST_LOG` / `TEST_UNRESOLVED` | Çıktı makroları |
+| `FS_AGING_A653_PRINT` | `TEST_PRINT` | Tüm mesajlar için printf benzeri çıktı fonksiyonu |
 
 Derleme zamanında `sizeof(float8_gt) == sizeof(fs_aging_float_t)` ve `FS_AGING_PATH_MAX <= MAX_NAME_LENGTH` kontrol edilir.
 

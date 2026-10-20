@@ -10,12 +10,11 @@
  *   2. Call fs_aging_a653_start(). It checks the setup and creates the
  *      periodic aging process. It does not touch the file system.
  *   3. Switch the partition to NORMAL mode.
- * When aging ends, a summary is logged and on_done is called from the
- * aging process.
+ * When aging ends, a summary is printed, on_done is called and the aging
+ * process ends.
  *
- * Results: this library is test infrastructure, so it never reports
- * PASSED or FAILED. If aging cannot be done it reports TEST_UNRESOLVED;
- * the test case decides the verdict of its own checks.
+ * All output, including errors, goes through FS_AGING_A653_PRINT. Error
+ * lines start with "fs_aging: error:".
  *
  * Original: https://github.com/saurabhkadekodi/geriatrix (BSD-2-Clause)
  */
@@ -51,18 +50,9 @@ extern "C" {
 #define FS_AGING_A653_MAX_FILE_SIZE  0xFFFFFFFFull
 #endif
 
-/* Output used by the library:
- *   PRINT  - console output (progress, distributions, core messages)
- *   LOG    - summary line sent to the test report
- *   ERROR  - aging could not be done; marks the test unresolved */
+/* printf-like output function used for all messages. */
 #ifndef FS_AGING_A653_PRINT
 #define FS_AGING_A653_PRINT          TEST_PRINT
-#endif
-#ifndef FS_AGING_A653_LOG
-#define FS_AGING_A653_LOG            TEST_LOG
-#endif
-#ifndef FS_AGING_A653_ERROR
-#define FS_AGING_A653_ERROR          TEST_UNRESOLVED
 #endif
 
 typedef struct {
@@ -89,14 +79,14 @@ typedef struct {
     uint32_t          progress_every;  /* print progress every N periods;
                                           0 = off                           */
 
-    /* Optional: called from the aging process when aging ends, also after
-     * an error (already reported as unresolved). End the test case here. */
+    /* Optional: called once from the aging process when aging ends,
+     * after success or error, just before the process ends. */
     void (*on_done)(fs_aging_status_t status);
 } fs_aging_a653_config_t;
 
 /* Checks the configuration and creates and starts the periodic aging
  * process. Call in INIT mode. Returns FS_AGING_RUNNING on success;
- * otherwise the error is already reported as unresolved. */
+ * otherwise prints the error and returns its status. */
 fs_aging_status_t fs_aging_a653_start(const fs_aging_a653_config_t *config);
 
 /* Current statistics of the running or finished aging. */
