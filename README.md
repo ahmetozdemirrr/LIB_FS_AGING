@@ -17,7 +17,8 @@ Bu belge iki okur için yazıldı:
 6. [Orijinal Geriatrix'ten farklar](#6-orijinal-geriatrixten-farklar)
 7. [POSIX port sözleşmesi](#7-posix-port-sözleşmesi)
 8. [Profiller ve `gen_profiles.py`](#8-profiller-ve-gen_profilespy)
-9. [Lisans](#9-lisans)
+9. [ARINC 653 port'u](#9-arinc-653-portu)
+10. [Lisans](#10-lisans)
 
 ---
 
@@ -26,7 +27,7 @@ Bu belge iki okur için yazıldı:
 Kütüphane, [Geriatrix](https://github.com/saurabhkadekodi/geriatrix) dosya sistemi yaşlandırma aracının **işlevsel karşılığıdır**. Geriatrix, bir profile göre kontrollü dosya oluşturma ve silme işlemleri yaparak dosya sisteminde gerçekçi dosya ve boş alan parçalanması üretir.
 
 - Makale: Saurabh Kadekodi, Vaishnavh Nagarajan, Gregory R. Ganger, Garth A. Gibson, *"Geriatrix: Aging what you see and what you don't see. A file system aging approach for modern storage systems"*, USENIX ATC 2018. PDF: <http://cs.cmu.edu/~saukad/geriatrix.pdf>
-- Orijinal kod C++11 ile yazılmıştır ve Boost'a bağımlıdır. Lisansı BSD-2-Clause'dur (bkz. [Lisans](#9-lisans)).
+- Orijinal kod C++11 ile yazılmıştır ve Boost'a bağımlıdır. Lisansı BSD-2-Clause'dur (bkz. [Lisans](#10-lisans)).
 
 Amaç, şirket RTOS'unda hem **ARINC 653** hem **POSIX** profilinde dosya sistemi aging testleri yapabilmektir. Orijinalle bire bir aynı dosya dizisini üretmek hedeflenmez. Hedef, profildeki **yaş**, **boyut** ve **dizin derinliği** dağılımlarına yakınsayan bir aging yükü üretmektir.
 
@@ -54,13 +55,21 @@ LIB_FS_AGING/
 │   └── src/
 │       ├── fs_aging.c           # tüm aging mantığı
 │       └── fs_aging_profiles.c  # ÜRETİLİR (TOOLS/gen_profiles.py), elle düzenlenmez
-├── ARINC653/                    # HENÜZ YAZILMADI (Görev 4, gerçek APEX header'ları bekleniyor)
+├── ARINC_FS_AGING/              # ARINC 653 port'u (bkz. bölüm 9)
+│   ├── include/
+│   │   └── fs_aging_arinc653.h  # port'un dış arayüzü
+│   └── src/
+│       ├── fs_aging_arinc653.c         # platform callback'leri (APEX dosya servisleri)
+│       └── fs_aging_arinc653_runner.c  # INIT'te kurulum, periyodik aging process'i
+├── POSIX_FS_AGING/              # POSIX port'u için yer tutucu (yalnızca talimat yorumları)
+│   ├── include/fs_aging_posix.h
+│   └── src/fs_aging_posix.c
 └── TOOLS/
     └── gen_profiles.py          # Geriatrix profil .txt dosyaları -> C tabloları
 ```
 
-- **ARINC653/** henüz yok. Planlanan içerik `ARINC653/include/fs_aging_arinc653.h`, `ARINC653/src/fs_aging_arinc653.c` (callback'ler) ve `ARINC653/src/fs_aging_arinc653_runner.c` (INIT modunda kurulum, periyodik process). Bu iş, gerçek APEX, `LIB_FILE_OPERATIONS`, `LIB_USER_PRINT` header'ları ve `float8_gt` tanımı gelene kadar bekliyor.
-- **POSIX port'u** bu repoda yazılmaz. Ayrı ekip tarafından [bölüm 7](#7-posix-port-sözleşmesi)'deki sözleşmeye göre yazılır.
+- **ARINC_FS_AGING/** ARINC 653 partition'ında aging yapar; kullanımı [bölüm 9](#9-arinc-653-portu)'da.
+- **POSIX_FS_AGING/** yalnızca yer tutucudur. POSIX port'u ayrı ekip tarafından [bölüm 7](#7-posix-port-sözleşmesi)'deki sözleşmeye göre yazılır; dosyalardaki yorumlar başlangıç noktasıdır.
 - Referans için klonlanan `geriatrix/` klasörü (varsa) salt okunurdur ve `.gitignore` ile repo dışında tutulur.
 
 Bir projeye eklemek için gereken tek şey: include yolu `FS_AGING_CORE/include`, derlenecek dosyalar `FS_AGING_CORE/src/fs_aging.c` ve hazır profiller kullanılacaksa `FS_AGING_CORE/src/fs_aging_profiles.c`.
@@ -514,7 +523,82 @@ python3 TOOLS/gen_profiles.py               # Linux
 
 Profil formatı (Geriatrix): ilk satır veri satırı sayısıdır. Ardından yaş dosyasında `<eşik> <ağırlık>`, boyut dosyasında `<byte> <ağırlık>`, dizin dosyasında `<derinlik> <ağırlık> <kardeş_dizin>` satırları gelir.
 
-## 9. Lisans
+## 9. ARINC 653 port'u
+
+`ARINC_FS_AGING/` çekirdeği bir ARINC 653 partition'ında çalıştırır. Test case INIT modunda aging'i hazırlar; NORMAL modda periyodik bir process her periyotta en fazla `ops_per_period` dosya işlemi yapar.
+
+### Kullanım
+
+```c
+#include "fs_aging_arinc653.h"
+
+static void aging_done(fs_aging_status_t status)
+{
+    /* Hata durumu kütüphane tarafından TEST_UNRESOLVED olarak raporlandı.
+     * Başarıda burada yaşlandırılmış diskle yapılacak test yapılır. */
+    (void)status;
+    REPORTER_TEST_CASE_END();
+}
+
+void FS_AGING_0001()
+{
+    RETURN_CODE_TYPE return_code = -1;
+    fs_aging_a653_config_t cfg = {
+        .profile_name   = "agrawal",
+        .mount_point    = "/mnt/fs1",
+        .volume_bytes   = 0u,           /* 0: boş alan GET_VOLUME_STATUS ile okunur */
+        .fill_ratio     = 0.8,
+        .seed           = 42u,
+        .ops_per_period = 50u,
+        .period         = MASTER_PARTITION_PERIOD,
+        .time_capacity  = INFINITE_TIME_VALUE,
+        .stack_size     = TEST_PROCESS_STACK_SIZE,
+        .priority       = MASTER_PROCESS_PRIORITY,
+        .core_id        = 0u,
+        .progress_every = 1000u,
+        .on_done        = aging_done,
+    };
+
+    if (FS_AGING_RUNNING != fs_aging_a653_start(&cfg)) {
+        REPORTER_TEST_CASE_END();       /* hata zaten UNRESOLVED olarak raporlandı */
+        return;
+    }
+    SET_PARTITION_MODE(NORMAL, &return_code);
+    CHECK_UNRESOLVED(return_code);
+}
+```
+
+### Davranış
+
+- `fs_aging_a653_start()` profili, parametreleri ve havuzun yeterliliğini kontrol eder; `CREATE_PROCESS`, `INITIALIZE_PROCESS_CORE_AFFINITY` ve `START` ile aging process'ini (adı `FS_AGING`, deadline `SOFT`) oluşturur. Dosya sistemine dokunmaz.
+- `volume_bytes = 0` verilirse aging process'i başlarken mount noktasında geçici bir dosya oluşturup `GET_VOLUME_STATUS` ile `FREE_BYTES` değerini okur, dosyayı siler ve aging'i bu boyutla başlatır. Volume'ün boş olması beklenir.
+- Kütüphane bir test altyapısıdır; **PASSED/FAILED vermez.** Aging yapılamazsa (geçersiz parametre, havuz yetersiz, process kurulamadı, boş alan okunamadı, aging hatayla bitti) `TEST_UNRESOLVED` gönderir. Bitişte bir özet satırı `TEST_LOG` ile rapora, ayrıntılı dağılımlar `TEST_PRINT` ile konsola gider.
+- `on_done` aging process'inden, başarıda da hatada da bir kez çağrılır. Test case'in sonucu ve `REPORTER_TEST_CASE_END()` burada verilir.
+- Partition başına tek aging çalışması desteklenir (havuz ve context statiktir).
+
+### Dosya oluşturma
+
+- `FS_AGING_A653_USE_RESIZE 1` (varsayılan): dosya `OPEN_NEW_FILE` + `RESIZE_FILE` ile boyutlandırılır; veri yazılmaz. `0`: `MAXIMUM_ATOMICITY` parçalarıyla `WRITE_FILE` yapılır. Hedefte `RESIZE_FILE`'ın gerçekten blok ayırdığı (`USED_BYTES` arttığı) doğrulanmadıysa `0` kullanın.
+- `RESIZE_FILE` en fazla 4 GiB - 1 boyut kabul eder (`FS_AGING_A653_MAX_FILE_SIZE`). Daha büyük profil boyutları çekirdeğe `NO_SPACE` olarak bildirilir.
+- `ENOSPC` → `NO_SPACE` (yarım dosya silinir), `MAKE_DIRECTORY`'de `EEXIST` → başarılı.
+
+### Derleme ayarları
+
+| Makro | Varsayılan | Anlamı |
+|---|---|---|
+| `FS_AGING_A653_POOL_CAPACITY` | `16384u` | Statik havuz kaydı (kayıt başına 24 byte, ~384 KB) |
+| `FS_AGING_A653_USE_RESIZE` | `1` | Dosya boyutlandırma yöntemi |
+| `FS_AGING_A653_MAX_FILE_SIZE` | `0xFFFFFFFF` | Dosya sisteminin kabul ettiği en büyük dosya |
+| `FS_AGING_A653_PRINT` / `_LOG` / `_ERROR` | `TEST_PRINT` / `TEST_LOG` / `TEST_UNRESOLVED` | Çıktı makroları |
+
+Derleme zamanında `sizeof(float8_gt) == sizeof(fs_aging_float_t)` ve `FS_AGING_PATH_MAX <= MAX_NAME_LENGTH` kontrol edilir.
+
+### Hedefte henüz doğrulanmayanlar
+
+- `RESIZE_FILE`'ın blok ayırıp ayırmadığı.
+- Partition bellek bütçesi, periyot ve pencere süresi (`ops_per_period` ve havuz boyutu buna göre seçilecek). SETUP aşamasında bir işlem bir yaprak dizini üst dizinleriyle birlikte oluşturduğu için periyot başına `MAKE_DIRECTORY` sayısı `ops_per_period × en büyük dizin derinliği`ne ulaşabilir.
+
+## 10. Lisans
 
 Bu kütüphane Geriatrix'in türev çalışmasıdır. Algoritma ve `FS_AGING_CORE/src/fs_aging_profiles.c` içindeki profil verileri orijinal Geriatrix reposundan alınmıştır:
 
