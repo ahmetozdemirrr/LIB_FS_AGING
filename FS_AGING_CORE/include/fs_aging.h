@@ -237,6 +237,7 @@ typedef struct {
     fs_aging_phase_t  phase;
     uint32_t          setup_dir_bin;
     uint32_t          setup_sibling;
+    uint32_t          setup_chain;
     uint32_t          rebin_active;
     uint32_t          rebin_cursor;
 

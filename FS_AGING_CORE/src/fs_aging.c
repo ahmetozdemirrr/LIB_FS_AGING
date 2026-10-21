@@ -439,35 +439,52 @@ static void do_delete(fs_aging_ctx_t *c)
 /* Phases                                                              */
 /* ================================================================== */
 
-/* SETUP: one op creates one leaf directory and its parents */
+/* Creates one directory; returns 0 on success. */
+static int setup_mkdir(fs_aging_ctx_t *c, const path_t *p)
+{
+    if (p->overflow != 0) {
+        fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: directory path too long");
+        return -1;
+    }
+    if (c->platform.make_dir(c->platform.user, p->buf) != FS_AGING_PLAT_OK) {
+        fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: make_dir failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* SETUP: one op creates exactly one directory. All leaves share the parent
+ * chain <mount>/d1/d2/..., which is created once, as deep as needed. */
 static void setup_one(fs_aging_ctx_t *c)
 {
     const fs_aging_profile_t *pr = c->profile;
 
     while (c->setup_dir_bin < pr->dir_count) {
         const fs_aging_dir_bin_t *d = &pr->dirs[c->setup_dir_bin];
-        uint32_t lvl;
+        path_t p;
 
         if (d->depth == 0u) {
             c->setup_dir_bin++;
             continue;
         }
+
+        /* Parent chain first, one level per op */
+        if (c->setup_chain < (d->depth - 1u)) {
+            p_init(&p, c->path_buf, FS_AGING_PATH_MAX);
+            build_dir_path(c, &p, c->setup_dir_bin, 0u, c->setup_chain + 1u);
+            if (setup_mkdir(c, &p) == 0) {
+                c->setup_chain++;
+            }
+            return;
+        }
+
         if ((d->sibling_dirs != 0u) && (c->setup_sibling == 0u)) {
             c->setup_sibling = 1u;
         }
-
-        for (lvl = 1u; lvl <= d->depth; lvl++) {
-            path_t p;
-            p_init(&p, c->path_buf, FS_AGING_PATH_MAX);
-            build_dir_path(c, &p, c->setup_dir_bin, c->setup_sibling, lvl);
-            if (p.overflow != 0) {
-                fail(c, FS_AGING_ERR_PATH_TOO_LONG, "fs_aging: directory path too long");
-                return;
-            }
-            if (c->platform.make_dir(c->platform.user, p.buf) != FS_AGING_PLAT_OK) {
-                fail(c, FS_AGING_ERR_PLATFORM, "fs_aging: make_dir failed");
-                return;
-            }
+        p_init(&p, c->path_buf, FS_AGING_PATH_MAX);
+        build_dir_path(c, &p, c->setup_dir_bin, c->setup_sibling, d->depth);
+        if (setup_mkdir(c, &p) != 0) {
+            return;
         }
 
         if ((d->sibling_dirs == 0u) || (c->setup_sibling >= d->sibling_dirs)) {
