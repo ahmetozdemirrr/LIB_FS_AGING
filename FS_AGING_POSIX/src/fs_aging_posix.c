@@ -27,5 +27,5 @@
  * Start aging on an empty volume and pass the real usable space as
  * volume_bytes (e.g. statvfs: f_bavail * f_frsize).
  *
- * See ARINC_FS_AGING/src/ for a complete port to follow.
+ * See FS_AGING_ARINC653/src/ for a complete port to follow.
  */

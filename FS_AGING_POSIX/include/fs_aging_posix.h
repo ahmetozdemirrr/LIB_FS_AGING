@@ -2,7 +2,7 @@
  * fs_aging_posix.h - POSIX port of the fs_aging library (to be written).
  *
  * This file is a placeholder for the POSIX team. Suggested interface,
- * mirroring the ARINC 653 port (ARINC_FS_AGING/include/fs_aging_arinc653.h):
+ * mirroring the ARINC 653 port (FS_AGING_ARINC653/include/fs_aging_arinc653.h):
  *
  *   - a config struct: profile name, mount point, volume size, fill
  *     ratio, seed, limits, and how many operations to run per call;

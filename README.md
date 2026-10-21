@@ -55,21 +55,21 @@ LIB_FS_AGING/
 │   └── src/
 │       ├── fs_aging.c           # tüm aging mantığı
 │       └── fs_aging_profiles.c  # ÜRETİLİR (TOOLS/gen_profiles.py), elle düzenlenmez
-├── ARINC_FS_AGING/              # ARINC 653 port'u (bkz. bölüm 9)
+├── FS_AGING_ARINC653/           # ARINC 653 port'u (bkz. bölüm 9)
 │   ├── include/
 │   │   └── fs_aging_arinc653.h  # port'un dış arayüzü
 │   └── src/
 │       ├── fs_aging_arinc653.c         # platform callback'leri (APEX dosya servisleri)
 │       └── fs_aging_arinc653_runner.c  # INIT'te kurulum, periyodik aging process'i
-├── POSIX_FS_AGING/              # POSIX port'u için yer tutucu (yalnızca talimat yorumları)
+├── FS_AGING_POSIX/              # POSIX port'u için yer tutucu (yalnızca talimat yorumları)
 │   ├── include/fs_aging_posix.h
 │   └── src/fs_aging_posix.c
 └── TOOLS/
     └── gen_profiles.py          # Geriatrix profil .txt dosyaları -> C tabloları
 ```
 
-- **ARINC_FS_AGING/** ARINC 653 partition'ında aging yapar; kullanımı [bölüm 9](#9-arinc-653-portu)'da.
-- **POSIX_FS_AGING/** yalnızca yer tutucudur. POSIX port'u ayrı ekip tarafından [bölüm 7](#7-posix-port-sözleşmesi)'deki sözleşmeye göre yazılır; dosyalardaki yorumlar başlangıç noktasıdır.
+- **FS_AGING_ARINC653/** ARINC 653 partition'ında aging yapar; kullanımı [bölüm 9](#9-arinc-653-portu)'da.
+- **FS_AGING_POSIX/** yalnızca yer tutucudur. POSIX port'u ayrı ekip tarafından [bölüm 7](#7-posix-port-sözleşmesi)'deki sözleşmeye göre yazılır; dosyalardaki yorumlar başlangıç noktasıdır.
 - Referans için klonlanan `geriatrix/` klasörü (varsa) salt okunurdur ve `.gitignore` ile repo dışında tutulur.
 
 Bir projeye eklemek için gereken tek şey: include yolu `FS_AGING_CORE/include`, derlenecek dosyalar `FS_AGING_CORE/src/fs_aging.c` ve hazır profiller kullanılacaksa `FS_AGING_CORE/src/fs_aging_profiles.c`.
@@ -525,7 +525,7 @@ Profil formatı (Geriatrix): ilk satır veri satırı sayısıdır. Ardından ya
 
 ## 9. ARINC 653 port'u
 
-`ARINC_FS_AGING/` çekirdeği bir ARINC 653 partition'ında çalıştırır. Bir test değil, belirli parametrelerle her seferinde aynı şekilde yaşlanmış diskler üreten bir araçtır. Uygulama INIT modunda aging'i hazırlar; NORMAL modda periyodik bir process her periyotta en fazla `ops_per_period` dosya işlemi yapar.
+`FS_AGING_ARINC653/` çekirdeği bir ARINC 653 partition'ında çalıştırır. Bir test değil, belirli parametrelerle her seferinde aynı şekilde yaşlanmış diskler üreten bir araçtır. Uygulama INIT modunda aging'i hazırlar; NORMAL modda periyodik bir process her periyotta en fazla `ops_per_period` dosya işlemi yapar.
 
 ### Kullanım
 
