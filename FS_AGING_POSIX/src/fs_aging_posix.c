@@ -2,7 +2,7 @@
  * fs_aging_posix.c - POSIX platform callbacks for fs_aging (to be written).
  *
  * This file is a placeholder for the POSIX team. What the callbacks must
- * do (full contract in README.md, POSIX port section):
+ * do (full contract in README.md, section "Kendi port'unuzu yazmak"):
  *
  *   create_file(path, size)
  *       open(path, O_CREAT | O_EXCL | O_WRONLY) and make the file exactly

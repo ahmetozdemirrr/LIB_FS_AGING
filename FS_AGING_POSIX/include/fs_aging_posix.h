@@ -12,6 +12,6 @@
  *     status other than FS_AGING_RUNNING, then prints the report;
  *   - fs_aging_posix_get_platform(): fills fs_aging_platform_t.
  *
- * The platform callback contract is in README.md (POSIX port section)
+ * The platform callback contract is in README.md, section "Kendi port'unuzu yazmak"
  * and in FS_AGING_CORE/include/fs_aging.h.
  */

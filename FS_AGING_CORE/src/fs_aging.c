@@ -2,7 +2,8 @@
  * fs_aging.c - File system aging core
  *
  * A port of Geriatrix (https://github.com/saurabhkadekodi/geriatrix,
- * BSD-2-Clause). Differences from Geriatrix: see README section 6.
+ * BSD-2-Clause). Differences from Geriatrix: see README.md, section
+ * "Orijinal Geriatrix'ten farklar".
  *
  * Does not use libc.
  */

@@ -5,7 +5,7 @@
  * calls fs_aging_step() once per period, so one period never runs more
  * than ops_per_period file operations.
  *
- * Usage, in the test case's INIT code:
+ * Usage, in the partition's INIT code:
  *   1. Fill an fs_aging_a653_config_t.
  *   2. Call fs_aging_a653_start(). It checks the setup and creates the
  *      periodic aging process. It does not touch the file system.
