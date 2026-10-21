@@ -288,6 +288,7 @@ void aging_partition_init(void)
         .priority       = AGING_PRIORITY,
         .core_id        = 0u,
         .progress_every = 1000u,        /* 1000 periyotta bir ilerleme bas */
+        .clean_first    = 0u,           /* 1: önce mount noktasını boşalt */
         .on_done        = NULL,         /* opsiyonel bitiş fonksiyonu */
     };
 
@@ -308,7 +309,21 @@ void aging_partition_init(void)
 - **Dosya oluşturma:** Varsayılan olarak `OPEN_NEW_FILE` + `RESIZE_FILE` ile, veri yazmadan yapılır. `FS_AGING_A653_USE_RESIZE 0` ile `MAXIMUM_ATOMICITY` parçaları hâlinde `WRITE_FILE` kullanılır.
 - **Çıktı:** Tüm mesajlar `TEST_PRINT` ile basılır. Hatalar `fs_aging: error: ...` ile başlar; bitişte tek satırlık bir `fs_aging: summary: ...` basılır.
 - **Hatalar:** INIT'teki hatalarda `fs_aging_a653_start()` hata kodunu döner; programı bitirmek INIT kodunun işidir (yukarıdaki örnekte olduğu gibi). Aging sırasındaki hatalarda mesaj basılır ve partition `IDLE`'a alınır.
-- Partition başına tek aging çalışması desteklenir.
+- **Dizin derinliği:** Dosya sistemi en fazla 32 seviye iç içe dizine izin verir ve bu sayıya mount noktasının kendi seviyeleri de dahildir (`/mnt/fs1` = 2). Profil daha derin dizin istiyorsa `fs_aging_a653_start()` baştan reddeder. Bu yüzden `pramod` (36 seviye) kullanılamaz; diğer profiller en fazla 15 seviye kullanır.
+- Partition başına tek çalışma desteklenir.
+
+### Yaşlanmış disk ve temizleme
+
+Aging bittiğinde yaşlanmış disk **olduğu gibi kalır**; kütüphane hiçbir şeyi silmez ya da biçimlendirmez. Çıktı bu yaşlanmış disktir.
+
+Bir diski yeniden yaşlandırmak ya da başka bir yaş için kullanmak gerekirse önce boşaltılmalıdır. Biçimlendirme en temiz başlangıçtır; biçimlendirme mümkün değilse kütüphanenin temizleme işlevi kullanılabilir:
+
+- `fs_aging_a653_start_cleanup(&cfg)`: Yalnızca temizlik yapar. Mount noktasının altındaki **her şeyi** (aging dosyaları ve testlerin bıraktıkları) siler, mount noktasının kendisini bırakır. Aging gibi periyot başına en fazla `ops_per_period` girdi işler, bitince `on_done` çağrılır ve partition `IDLE`'a alınır. Başarıda `on_done`'a `FS_AGING_DONE_CONVERGED` gelir.
+- `cfg.clean_first = 1u`: `fs_aging_a653_start()` önce temizlik yapar, ardından aynı çalışmada aging başlar. `volume_bytes = 0` ile birlikte kullanılırsa boş alan temizlikten sonra okunur.
+
+Temizlik hiçbir zaman kendiliğinden çalışmaz; yalnızca bu iki yoldan biri seçildiğinde çalışır.
+
+Not: Testler yaşlanmış diskin üzerine yazdıkça disk değişir. Aynı yaştaki diskle tekrar tekrar test yapılacaksa aging'den hemen sonra diskin bir kopyası alınabilir ya da disk aynı profil, boyut ve seed ile yeniden üretilebilir.
 
 ### Derleme ayarları
 
@@ -317,6 +332,7 @@ void aging_partition_init(void)
 | `FS_AGING_A653_POOL_CAPACITY` | `16384u` | Statik havuz boyutu (kayıt başına 24 byte, ~384 KB) |
 | `FS_AGING_A653_USE_RESIZE` | `1` | `1`: `RESIZE_FILE`, `0`: veri yazarak |
 | `FS_AGING_A653_MAX_FILE_SIZE` | `0xFFFFFFFF` | En büyük dosya (`RESIZE_FILE` sınırı); daha büyükleri `NO_SPACE` sayılır |
+| `FS_AGING_A653_MAX_DIR_DEPTH` | `32u` | Dosya sisteminin izin verdiği en derin dizin seviyesi (mount noktası dahil) |
 | `FS_AGING_A653_IDLE_AT_END` | `1` | Aging bitince partition'ı `IDLE`'a al |
 | `FS_AGING_A653_PRINT` | `TEST_PRINT` | Çıktı fonksiyonu |
 
@@ -345,7 +361,7 @@ Seçerken:
 
 - **`agrawal`**: dengeli, genel amaçlı ve hızlı yakınsar; varsayılan olarak önerilir.
 - **`wang_os`, `wang_lanl`**: dizin ağacı yoktur, tüm dosyalar doğrudan mount noktasındadır.
-- **`pramod`**: en derin dizin ağacı (36 seviye) ve 32 GiB'a kadar dev dosyalar.
+- **`pramod`**: en derin dizin ağacı (36 seviye) ve 32 GiB'a kadar dev dosyalar. ARINC 653 dosya sisteminin 32 seviye sınırını aştığı için orada kullanılamaz.
 - **`douceur`**: yaş dağılımı çok geniştir; aynı disk için diğerlerinden çok daha fazla işlem ister.
 
 Profil tabloları `FS_AGING_CORE/src/fs_aging_profiles.c` içindedir ve **elle düzenlenmez**. Yeni bir profil eklemek için `TOOLS/gen_profiles.py`, Geriatrix formatındaki üç metin dosyasından (`age_distribution.txt`, `size_distribution.txt`, `dir_distribution.txt`) bu dosyayı yeniden üretir:

@@ -10,6 +10,9 @@
  *   2. Call fs_aging_a653_start(). It checks the setup and creates the
  *      periodic aging process. It does not touch the file system.
  *   3. Switch the partition to NORMAL mode.
+ * The aged disk is the result: nothing is removed after aging. To reuse a
+ * disk, clean it first (clean_first or fs_aging_a653_start_cleanup()).
+ *
  * All aging work runs inside the aging process. When aging ends, with
  * success or error, a summary is printed, on_done is called and the
  * partition is switched to IDLE (see FS_AGING_A653_IDLE_AT_END).
@@ -51,6 +54,13 @@ extern "C" {
 #define FS_AGING_A653_MAX_FILE_SIZE  0xFFFFFFFFull
 #endif
 
+/* Deepest directory the file system allows, counting every path component
+ * including the mount point (FS_MAXIMUM_DIRECTORY_HIERARCHY_DEPTH). A
+ * profile that needs deeper directories is rejected at start. */
+#ifndef FS_AGING_A653_MAX_DIR_DEPTH
+#define FS_AGING_A653_MAX_DIR_DEPTH  32u
+#endif
+
 /* 1: switch the partition to IDLE when aging ends, so the program stops.
  * 0: only the aging process ends; the partition keeps running. */
 #ifndef FS_AGING_A653_IDLE_AT_END
@@ -75,6 +85,8 @@ typedef struct {
     uint32_t          overwrite_runs;  /* 0 = no workload limit             */
     uint32_t          time_limit_s;    /* 0 = no time limit                 */
     fs_aging_float_t  confidence;      /* 0 = full convergence              */
+    uint32_t          clean_first;     /* 1 = remove everything under
+                                          mount_point before aging          */
 
     /* Aging process */
     uint32_t          ops_per_period;  /* file operations per period        */
@@ -95,6 +107,14 @@ typedef struct {
  * process. Call in INIT mode. Returns FS_AGING_RUNNING on success;
  * otherwise prints the error and returns its status. */
 fs_aging_status_t fs_aging_a653_start(const fs_aging_a653_config_t *config);
+
+/* Cleanup only: creates the same periodic process, which removes every
+ * file and directory under mount_point (not the mount point itself), up
+ * to ops_per_period entries per period, then calls on_done and goes IDLE.
+ * Uses mount_point and the process fields of config. on_done gets
+ * FS_AGING_DONE_CONVERGED when the volume is empty, otherwise an error.
+ * Call in INIT mode. Never runs automatically after aging. */
+fs_aging_status_t fs_aging_a653_start_cleanup(const fs_aging_a653_config_t *config);
 
 /* Current statistics of the running or finished aging. */
 void fs_aging_a653_get_stats(fs_aging_stats_t *out);
