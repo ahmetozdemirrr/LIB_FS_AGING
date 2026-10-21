@@ -4,7 +4,8 @@
  * fs_aging_a653_start() checks the setup in INIT mode and creates one
  * periodic process. In NORMAL mode that process runs up to
  * ops_per_period operations per period until aging ends, then prints a
- * summary, calls on_done and ends. Errors are printed and end the run.
+ * summary, calls on_done and switches the partition to IDLE. Errors are
+ * printed and end the run the same way.
  *
  * Only one aging run per partition: the pool and context are static.
  *
@@ -105,6 +106,18 @@ static void finish(fs_aging_status_t status)
     if (NULL != a653_cfg.on_done) {
         a653_cfg.on_done(status);
     }
+
+#if FS_AGING_A653_IDLE_AT_END
+    {
+        RETURN_CODE_TYPE return_code = NO_ERROR;
+        FS_AGING_A653_PRINT("fs_aging: done, switching partition to IDLE\r\n");
+        SET_PARTITION_MODE(IDLE, &return_code);
+        if (NO_ERROR != return_code) {
+            FS_AGING_A653_PRINT("fs_aging: error: SET_PARTITION_MODE(IDLE) failed (%d)\r\n",
+                                (int)return_code);
+        }
+    }
+#endif
 }
 
 /* Entry point of the periodic aging process. */

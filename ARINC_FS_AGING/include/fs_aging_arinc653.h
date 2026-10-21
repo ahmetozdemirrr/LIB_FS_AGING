@@ -10,8 +10,9 @@
  *   2. Call fs_aging_a653_start(). It checks the setup and creates the
  *      periodic aging process. It does not touch the file system.
  *   3. Switch the partition to NORMAL mode.
- * When aging ends, a summary is printed, on_done is called and the aging
- * process ends.
+ * All aging work runs inside the aging process. When aging ends, with
+ * success or error, a summary is printed, on_done is called and the
+ * partition is switched to IDLE (see FS_AGING_A653_IDLE_AT_END).
  *
  * All output, including errors, goes through FS_AGING_A653_PRINT. Error
  * lines start with "fs_aging: error:".
@@ -50,6 +51,12 @@ extern "C" {
 #define FS_AGING_A653_MAX_FILE_SIZE  0xFFFFFFFFull
 #endif
 
+/* 1: switch the partition to IDLE when aging ends, so the program stops.
+ * 0: only the aging process ends; the partition keeps running. */
+#ifndef FS_AGING_A653_IDLE_AT_END
+#define FS_AGING_A653_IDLE_AT_END    1
+#endif
+
 /* printf-like output function used for all messages. */
 #ifndef FS_AGING_A653_PRINT
 #define FS_AGING_A653_PRINT          TEST_PRINT
@@ -80,7 +87,7 @@ typedef struct {
                                           0 = off                           */
 
     /* Optional: called once from the aging process when aging ends,
-     * after success or error, just before the process ends. */
+     * after success or error, before the partition goes IDLE. */
     void (*on_done)(fs_aging_status_t status);
 } fs_aging_a653_config_t;
 

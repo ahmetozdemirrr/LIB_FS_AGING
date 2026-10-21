@@ -534,7 +534,8 @@ Profil formatı (Geriatrix): ilk satır veri satırı sayısıdır. Ardından ya
 
 static void aging_done(fs_aging_status_t status)
 {
-    /* Özet ve varsa hata mesajı basıldı; aging process'i bundan sonra biter. */
+    /* Özet ve varsa hata mesajı basıldı; bu fonksiyondan sonra kütüphane
+     * partition'ı IDLE'a alır. İhtiyaç yoksa on_done NULL bırakılabilir. */
     (void)status;
 }
 
@@ -559,8 +560,10 @@ void aging_partition_init(void)
     };
 
     if (FS_AGING_RUNNING != fs_aging_a653_start(&cfg)) {
-        return;                         /* hata mesajı basıldı */
+        SET_PARTITION_MODE(IDLE, &return_code);   /* hata basıldı; programı bitir */
+        return;
     }
+    /* INIT burada biter; aging'in tamamı aging process'inde yürür. */
     SET_PARTITION_MODE(NORMAL, &return_code);
     if (NO_ERROR != return_code) {
         TEST_PRINT("SET_PARTITION_MODE failed (%d)\r\n", (int)return_code);
@@ -573,8 +576,9 @@ void aging_partition_init(void)
 - `fs_aging_a653_start()` profili, parametreleri ve havuzun yeterliliğini kontrol eder; `CREATE_PROCESS`, `INITIALIZE_PROCESS_CORE_AFFINITY` ve `START` ile aging process'ini (adı `FS_AGING`, deadline `SOFT`) oluşturur. Dosya sistemine dokunmaz.
 - `volume_bytes = 0` verilirse aging process'i başlarken mount noktasında geçici bir dosya oluşturup `GET_VOLUME_STATUS` ile `FREE_BYTES` değerini okur, dosyayı siler ve aging'i bu boyutla başlatır. Volume'ün boş olması beklenir.
 - Test reporter'ı kullanılmaz. Tüm çıktı `TEST_PRINT` (printf) ile basılır: ilerleme, bitişte dağılımlar ve tek satırlık özet (`fs_aging: summary: ...`). Hatalar `fs_aging: error: ...` ile başlar.
-- Hata olursa (geçersiz parametre, havuz yetersiz, process kurulamadı, boş alan okunamadı, aging hatayla bitti) mesaj basılır ve çalışma biter: INIT'te `fs_aging_a653_start()` hata kodunu döner, NORMAL modda aging process'i sonlanır.
-- `on_done` aging process'inden, başarıda da hatada da bir kez çağrılır; ardından process biter.
+- INIT kodu yalnızca `fs_aging_a653_start()` ve `SET_PARTITION_MODE(NORMAL)` çağırır. Boş alan okuma, aging, rapor ve bitiş tamamen aging process'inin içinde olur.
+- Aging bittiğinde (başarı ya da hata) özet basılır, `on_done` çağrılır ve kütüphane `SET_PARTITION_MODE(IDLE)` ile partition'ı durdurur; program biter. Partition'ın çalışmaya devam etmesi isteniyorsa `FS_AGING_A653_IDLE_AT_END 0` ile derleyin.
+- INIT'te hata olursa (geçersiz parametre, havuz yetersiz, process kurulamadı) `fs_aging_a653_start()` mesajı basıp hata kodunu döner; kütüphane partition moduna dokunmaz. Programı bitirmek INIT kodunun işidir (örnekte `SET_PARTITION_MODE(IDLE)`).
 - Partition başına tek aging çalışması desteklenir (havuz ve context statiktir).
 
 ### Dosya oluşturma
@@ -590,6 +594,7 @@ void aging_partition_init(void)
 | `FS_AGING_A653_POOL_CAPACITY` | `16384u` | Statik havuz kaydı (kayıt başına 24 byte, ~384 KB) |
 | `FS_AGING_A653_USE_RESIZE` | `1` | Dosya boyutlandırma yöntemi |
 | `FS_AGING_A653_MAX_FILE_SIZE` | `0xFFFFFFFF` | Dosya sisteminin kabul ettiği en büyük dosya |
+| `FS_AGING_A653_IDLE_AT_END` | `1` | Aging bitince partition'ı `IDLE`'a al |
 | `FS_AGING_A653_PRINT` | `TEST_PRINT` | Tüm mesajlar için printf benzeri çıktı fonksiyonu |
 
 Derleme zamanında `sizeof(float8_gt) == sizeof(fs_aging_float_t)` ve `FS_AGING_PATH_MAX <= MAX_NAME_LENGTH` kontrol edilir.
